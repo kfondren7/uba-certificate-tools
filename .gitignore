@@ -1,0 +1,55 @@
+# Sensitive certificate files
+*.key
+*.p12
+*.pfx
+*.jks
+keystore.*
+truststore.*
+
+# Temporary directories
+/tmp/
+*_test_certs/
+*_fips_test_certs/
+
+# Log files
+*.log
+*.out
+*.err
+
+# Backup directories
+cert_backups/
+*_backup*/
+backup_*/
+
+# Local configuration overrides
+local/
+*.local
+
+# OS specific files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Editor files
+.vscode/
+.idea/
+*.sublime-*
+
+# Test artifacts
+test_output/
+test_results/
+
+# UBA specific temporary files
+caspida.out
+jobmanager.out
+*.debug.log
+
+# Certificate installation logs
+uba_cert_install_*.log
+cert_install_*.log
+
+# Private configuration
+private/
+secrets/
