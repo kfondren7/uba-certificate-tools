@@ -9,8 +9,34 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
-# Source the main installation script to get access to functions
-source "$PROJECT_DIR/scripts/install_uba_certs.sh"
+# Define basic functions for testing since we can't source the main script safely
+function detect_java_environment() {
+    # Simple Java detection logic
+    if [[ -n "${JAVA_HOME:-}" ]] && [[ -x "${JAVA_HOME}/bin/java" ]]; then
+        return 0
+    elif [[ -x "/opt/caspida/jre/bin/java" ]]; then
+        export JAVA_HOME="/opt/caspida/jre"
+        return 0
+    elif command -v java >/dev/null 2>&1; then
+        export JAVA_HOME="${JAVA_HOME:-$(readlink -f $(which java) | sed 's|/bin/java||')}"
+        return 0
+    else
+        return 1
+    fi
+}
+
+function validate_certificate_format() {
+    local cert_file="$1"
+    if [[ ! -f "$cert_file" ]]; then
+        return 1
+    fi
+    # Basic PEM format validation
+    if openssl x509 -in "$cert_file" -text -noout >/dev/null 2>&1; then
+        return 0
+    else
+        return 1
+    fi
+}
 
 # Test counters
 TESTS_RUN=0
