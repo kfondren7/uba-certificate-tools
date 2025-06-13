@@ -97,7 +97,8 @@ UBA_KEYSTORE="/etc/caspida/conf/keystore/uba-keystore"
 # Missing: Kafka keystores for data ingestion
 KAFKA_KEYSTORE_CONFIG="/opt/caspida/conf/kafka/kafka.properties"
 KAFKA_TRUSTSTORE="/opt/caspida/conf/kafka/auth/server.truststore.jks"
-JAVA_CACERTS="${JAVA_HOME}/lib/security/cacerts"
+# JAVA_CACERTS will be updated after JAVA_HOME is detected, but initialize with default
+JAVA_CACERTS="${JAVA_HOME:-/opt/java/current}/lib/security/cacerts"
 
 # Default configuration
 CERT_SOURCE_DIR=""
@@ -112,8 +113,18 @@ INSTALL_UBA_KEYSTORE=true
 INSTALL_KAFKA_CERTS=false  # Optional, only if Kafka ingestion is used
 VALIDATE_CERTS=true
 RESTART_SERVICES=true
-DRY_RUN=false
 VERBOSE=false
+DRY_RUN=false
+
+# Global certificate arrays - must be declared early to avoid unbound variable errors
+declare -gA CERT_FILES
+declare -gA KEY_FILES  
+declare -ga CA_FILES
+
+# Service management tracking
+SERVICE_MANAGEMENT_METHOD=""
+
+# Other global variables
 
 # Remote certificate pulling configuration
 declare -a SPLUNK_HOSTS=()
@@ -192,19 +203,37 @@ check_java_cacerts_access() {
         return 1
     fi
     
-    if [[ ! -w "$JAVA_CACERTS" ]]; then
-        log_error "Cannot write to Java cacerts file: $JAVA_CACERTS"
-        log_error "Please run as root or check file permissions"
-        return 1
+    # Check if we have write access directly
+    if [[ -w "$JAVA_CACERTS" ]]; then
+        log_debug "Direct write access to Java cacerts: $JAVA_CACERTS"
+        export JAVA_CACERTS_NEEDS_SUDO=false
+    else
+        # Check if we can access with sudo
+        if sudo test -w "$JAVA_CACERTS" 2>/dev/null; then
+            log "Java cacerts requires sudo access: $JAVA_CACERTS"
+            export JAVA_CACERTS_NEEDS_SUDO=true
+        else
+            log_error "Cannot write to Java cacerts file even with sudo: $JAVA_CACERTS"
+            log_error "Please check file permissions and sudo access"
+            return 1
+        fi
     fi
     
-    # Test access with default password
-    if ! "$JAVA_HOME/bin/keytool" -list -keystore "$JAVA_CACERTS" -storepass "changeit" &>/dev/null; then
-        log_error "Cannot access Java cacerts with default password"
-        return 1
+    # Test access with default password (use sudo if needed)
+    local keytool_cmd="\"$JAVA_HOME/bin/keytool\" -list -keystore \"$JAVA_CACERTS\" -storepass \"changeit\""
+    if [[ "$JAVA_CACERTS_NEEDS_SUDO" == "true" ]]; then
+        if ! sudo bash -c "$keytool_cmd" &>/dev/null; then
+            log_error "Cannot access Java cacerts with default password (with sudo)"
+            return 1
+        fi
+    else
+        if ! "$JAVA_HOME/bin/keytool" -list -keystore "$JAVA_CACERTS" -storepass "changeit" &>/dev/null; then
+            log_error "Cannot access Java cacerts with default password"
+            return 1
+        fi
     fi
     
-    log_debug "Java cacerts access verified: $JAVA_CACERTS"
+    log_debug "Java cacerts access verified: $JAVA_CACERTS (sudo: $JAVA_CACERTS_NEEDS_SUDO)"
     return 0
 }
 
@@ -354,8 +383,14 @@ check_prerequisites() {
     
     # Create required directories
     if [[ "$DRY_RUN" == "false" ]]; then
-        mkdir -p "$UBA_CUSTOM_CERTS_DIR" "$BACKUP_DIR" "$(dirname "$LOG_FILE")"
-        chown caspida:caspida "$UBA_CUSTOM_CERTS_DIR" 2>/dev/null || true
+        sudo mkdir -p "$UBA_CUSTOM_CERTS_DIR" "$BACKUP_DIR" "$(dirname "$LOG_FILE")"
+        sudo chown caspida:caspida "$UBA_CUSTOM_CERTS_DIR" "$BACKUP_DIR" "$(dirname "$LOG_FILE")" 2>/dev/null || true
+    fi
+    
+    # Test UBA keystore access (if they exist)
+    log "Testing existing UBA keystore access..."
+    if ! test_all_uba_keystores; then
+        log_warn "Some UBA keystores have access issues - this may be normal if keystores don't exist yet"
     fi
     
     log "Prerequisites check completed successfully"
@@ -432,10 +467,10 @@ discover_certificates() {
         exit 1
     fi
     
-    # Arrays to store discovered certificates
-    declare -gA CERT_FILES
-    declare -gA KEY_FILES
-    declare -ga CA_FILES
+    # Initialize arrays for this discovery session
+    CERT_FILES=()
+    KEY_FILES=()
+    CA_FILES=()
     
     # Find certificate files
     while IFS= read -r -d '' file; do
@@ -486,7 +521,8 @@ pull_splunk_certificates() {
     fi
     
     # Create directory for pulled certificates
-    mkdir -p "$pull_dir"
+    sudo mkdir -p "$pull_dir"
+    sudo chown caspida:caspida "$pull_dir" 2>/dev/null || true
     
     local pulled_count=0
     local failed_count=0
@@ -667,22 +703,46 @@ backup_existing_certs() {
         return 0
     fi
     
+    # Create backup directory with proper ownership
+    if ! mkdir -p "$BACKUP_DIR"; then
+        log_error "Failed to create backup directory: $BACKUP_DIR"
+        return 1
+    fi
+    
+    # Set proper ownership for backup directory
+    if ! sudo chown caspida:caspida "$BACKUP_DIR"; then
+        log_warn "Could not set ownership for backup directory (continuing anyway)"
+    fi
+    
     # Backup UBA certificates
     if [[ -d "$UBA_CERTS_DIR" ]]; then
-        cp -r "$UBA_CERTS_DIR" "$BACKUP_DIR/original_certs" 2>/dev/null || true
+        if cp -r "$UBA_CERTS_DIR" "$BACKUP_DIR/original_certs" 2>/dev/null; then
+            sudo chown -R caspida:caspida "$BACKUP_DIR/original_certs" 2>/dev/null || true
+            log "Backed up UBA certificates to: $BACKUP_DIR/original_certs"
+        fi
     fi
     
     # Backup Job Manager keystore
     if [[ -f "$UBA_KEYSTORE_JM" ]]; then
-        cp "$UBA_KEYSTORE_JM" "$BACKUP_DIR/keystore.jm.backup" 2>/dev/null || true
+        if cp "$UBA_KEYSTORE_JM" "$BACKUP_DIR/keystore.jm.backup" 2>/dev/null; then
+            sudo chown caspida:caspida "$BACKUP_DIR/keystore.jm.backup" 2>/dev/null || true
+            log "Backed up Job Manager keystore to: $BACKUP_DIR/keystore.jm.backup"
+        fi
     fi
     
     # Backup site properties
     if [[ -f "$UBA_SITE_PROPERTIES" ]]; then
-        cp "$UBA_SITE_PROPERTIES" "$BACKUP_DIR/uba-site.properties.backup" 2>/dev/null || true
+        if cp "$UBA_SITE_PROPERTIES" "$BACKUP_DIR/uba-site.properties.backup" 2>/dev/null; then
+            sudo chown caspida:caspida "$BACKUP_DIR/uba-site.properties.backup" 2>/dev/null || true
+            log "Backed up site properties to: $BACKUP_DIR/uba-site.properties.backup"
+        fi
     fi
     
-    log "Backup completed: $BACKUP_DIR"
+    # Set final permissions on entire backup directory
+    sudo chmod -R 640 "$BACKUP_DIR"/* 2>/dev/null || true
+    sudo chmod 750 "$BACKUP_DIR" 2>/dev/null || true
+    
+    log "Backup completed with proper ownership: $BACKUP_DIR"
 }
 
 generate_pkcs12() {
@@ -759,12 +819,16 @@ install_ui_certificates() {
     cp "$cert_file" "$custom_cert"
     cp "$key_file" "$custom_key"
     
+    # Set proper ownership for UI certificate files
+    sudo chown caspida:caspida "$custom_cert" "$custom_key" 2>/dev/null || true
+    chmod 640 "$custom_cert" "$custom_key" 2>/dev/null || true
+    
     # Install CA certificate if available
     if [[ "${#CA_FILES[@]}" -gt 0 ]]; then
         cp "${CA_FILES[0]}" "$custom_ca"
+        sudo chown caspida:caspida "$custom_ca" 2>/dev/null || true
+        chmod 640 "$custom_ca" 2>/dev/null || true
     fi
-    
-    # Note: Ownership and permissions will be set centrally after all certificate installation
     
     # Update uba-site.properties
     update_site_properties "$custom_ca" "$custom_key" "$custom_cert"
@@ -820,13 +884,17 @@ install_job_manager_certificates() {
     
     # Backup existing keystore
     if [[ -f "$UBA_KEYSTORE_JM" ]]; then
-        cp "$UBA_KEYSTORE_JM" "$UBA_KEYSTORE_JM.backup.$(date +%Y%m%d_%H%M%S)"
+        local backup_file="$UBA_KEYSTORE_JM.backup.$(date +%Y%m%d_%H%M%S)"
+        cp "$UBA_KEYSTORE_JM" "$backup_file"
+        sudo chown caspida:caspida "$backup_file" 2>/dev/null || true
+        log "Backed up Job Manager keystore to: $backup_file"
     fi
     
     # Check if keystore exists and create if needed
     if [[ ! -f "$UBA_KEYSTORE_JM" ]]; then
         log "Creating new Job Manager keystore: $UBA_KEYSTORE_JM"
-        mkdir -p "$(dirname "$UBA_KEYSTORE_JM")"
+        sudo mkdir -p "$(dirname "$UBA_KEYSTORE_JM")"
+        sudo chown caspida:caspida "$(dirname "$UBA_KEYSTORE_JM")" 2>/dev/null || true
     fi
     
     # Check if jmserver alias exists and delete if present
@@ -874,8 +942,22 @@ install_search_head_certificates() {
         return 1
     fi
     
-    # Backup Java cacerts
-    cp "$JAVA_CACERTS" "$JAVA_CACERTS.backup.$(date +%Y%m%d_%H%M%S)"
+    # Backup Java cacerts (use sudo if needed)
+    local backup_file="$JAVA_CACERTS.backup.$(date +%Y%m%d_%H%M%S)"
+    if [[ "$JAVA_CACERTS_NEEDS_SUDO" == "true" ]]; then
+        if ! sudo cp "$JAVA_CACERTS" "$backup_file"; then
+            log_error "Failed to backup Java cacerts with sudo"
+            return 1
+        fi
+        sudo chown caspida:caspida "$backup_file" 2>/dev/null || true
+    else
+        if ! cp "$JAVA_CACERTS" "$backup_file"; then
+            log_error "Failed to backup Java cacerts"
+            return 1
+        fi
+        sudo chown caspida:caspida "$backup_file" 2>/dev/null || true
+    fi
+    log "Java cacerts backed up to: $backup_file"
     
     local cert_count=0
     for ca_file in "${CA_FILES[@]}"; do
@@ -889,30 +971,68 @@ install_search_head_certificates() {
         local alias="uba_ca_$(basename "$ca_file" .crt)_$cert_count"
         
         # Check if certificate with same alias exists and remove if present
-        if "$JAVA_HOME/bin/keytool" -list -keystore "$JAVA_CACERTS" -storepass "changeit" -alias "$alias" &>/dev/null; then
+        local check_cmd="\"$JAVA_HOME/bin/keytool\" -list -keystore \"$JAVA_CACERTS\" -storepass \"changeit\" -alias \"$alias\""
+        local cert_exists=false
+        
+        if [[ "$JAVA_CACERTS_NEEDS_SUDO" == "true" ]]; then
+            if sudo bash -c "$check_cmd" &>/dev/null; then
+                cert_exists=true
+            fi
+        else
+            if "$JAVA_HOME/bin/keytool" -list -keystore "$JAVA_CACERTS" -storepass "changeit" -alias "$alias" &>/dev/null; then
+                cert_exists=true
+            fi
+        fi
+        
+        if [[ "$cert_exists" == "true" ]]; then
             log "Removing existing CA certificate with alias '$alias'"
-            "$JAVA_HOME/bin/keytool" -delete -alias "$alias" -keystore "$JAVA_CACERTS" -storepass "changeit"
-            if [[ $? -eq 0 ]]; then
-                log "Successfully removed existing CA certificate '$alias'"
+            local delete_cmd="\"$JAVA_HOME/bin/keytool\" -delete -alias \"$alias\" -keystore \"$JAVA_CACERTS\" -storepass \"changeit\""
+            
+            if [[ "$JAVA_CACERTS_NEEDS_SUDO" == "true" ]]; then
+                if sudo bash -c "$delete_cmd"; then
+                    log "Successfully removed existing CA certificate '$alias'"
+                else
+                    log_warn "Failed to remove existing CA certificate '$alias', continuing anyway"
+                fi
             else
-                log_warn "Failed to remove existing CA certificate '$alias', continuing anyway"
+                if "$JAVA_HOME/bin/keytool" -delete -alias "$alias" -keystore "$JAVA_CACERTS" -storepass "changeit"; then
+                    log "Successfully removed existing CA certificate '$alias'"
+                else
+                    log_warn "Failed to remove existing CA certificate '$alias', continuing anyway"
+                fi
             fi
         else
             log_debug "No existing CA certificate found with alias '$alias'"
         fi
         
         # Import CA certificate with proper parameters
-        "$JAVA_HOME/bin/keytool" -import -trustcacerts -alias "$alias" -file "$ca_file" -keystore "$JAVA_CACERTS" -storepass "changeit" -noprompt
+        local import_cmd="\"$JAVA_HOME/bin/keytool\" -import -trustcacerts -alias \"$alias\" -file \"$ca_file\" -keystore \"$JAVA_CACERTS\" -storepass \"changeit\" -noprompt"
         
-        if [[ $? -eq 0 ]]; then
-            log "Imported CA certificate: $ca_file (alias: $alias)"
-            ((cert_count++))
+        if [[ "$JAVA_CACERTS_NEEDS_SUDO" == "true" ]]; then
+            if sudo bash -c "$import_cmd"; then
+                log "Imported CA certificate: $ca_file (alias: $alias)"
+                ((cert_count++))
+            else
+                log_error "Failed to import CA certificate: $ca_file"
+            fi
         else
-            log_error "Failed to import CA certificate: $ca_file"
+            if "$JAVA_HOME/bin/keytool" -import -trustcacerts -alias "$alias" -file "$ca_file" -keystore "$JAVA_CACERTS" -storepass "changeit" -noprompt; then
+                log "Imported CA certificate: $ca_file (alias: $alias)"
+                ((cert_count++))
+            else
+                log_error "Failed to import CA certificate: $ca_file"
+            fi
         fi
     done
     
     log "Installed $cert_count CA certificates to Java truststore"
+    
+    if [[ $cert_count -gt 0 ]]; then
+        return 0
+    else
+        log_error "No CA certificates were successfully installed"
+        return 1
+    fi
 }
 
 install_uba_keystore_certificates() {
@@ -963,11 +1083,15 @@ install_uba_keystore_certificates() {
     
     # Backup existing keystore
     if [[ -f "$UBA_KEYSTORE" ]]; then
-        cp "$UBA_KEYSTORE" "$UBA_KEYSTORE.backup.$(date +%Y%m%d_%H%M%S)"
+        local backup_file="$UBA_KEYSTORE.backup.$(date +%Y%m%d_%H%M%S)"
+        cp "$UBA_KEYSTORE" "$backup_file"
+        sudo chown caspida:caspida "$backup_file" 2>/dev/null || true
+        log "Backed up UBA keystore to: $backup_file"
     fi
     
     # Create keystore directory if needed
-    mkdir -p "$(dirname "$UBA_KEYSTORE")"
+    sudo mkdir -p "$(dirname "$UBA_KEYSTORE")"
+    sudo chown caspida:caspida "$(dirname "$UBA_KEYSTORE")" 2>/dev/null || true
     
     # Check if uba-server alias exists and delete if present
     if [[ -f "$UBA_KEYSTORE" ]] && "$JAVA_HOME/bin/keytool" -list -keystore "$UBA_KEYSTORE" -storepass "password" -alias "uba-server" &>/dev/null; then
@@ -982,11 +1106,22 @@ install_uba_keystore_certificates() {
     if "$JAVA_HOME/bin/keytool" -list -v -keystore "$UBA_KEYSTORE" -storepass "password" | grep -q "uba-server"; then
         log "UBA keystore certificate installed successfully"
         
-        # Sync keystore with all UBA nodes (per documentation)
+        # Test keystore access before sync
+        log "Testing UBA keystore access after certificate installation..."
+        if ! test_keystore_access "$UBA_KEYSTORE" "password" "UBA Internal"; then
+            log_warn "UBA keystore access test failed, but certificate appears to be installed"
+        fi
+        
+        # Sync keystore with all UBA nodes using enhanced setup
         if [[ -f "/opt/caspida/bin/Caspida" ]]; then
-            sudo -u caspida /opt/caspida/bin/Caspida setup-uba-keystore 2>/dev/null || {
-                log_warn "Failed to sync UBA keystore - may need manual sync across cluster nodes"
-            }
+            log "Running enhanced UBA keystore setup to sync across cluster nodes..."
+            
+            if ! enhanced_setup_uba_keystore; then
+                log_warn "Enhanced UBA keystore setup had issues - this may be normal for some environments"
+                log_warn "Check that the keystore is properly configured for your environment"
+            fi
+        else
+            log_warn "Caspida management script not found, skipping keystore sync"
         fi
     else
         log_error "Failed to install UBA keystore certificate"
@@ -1021,7 +1156,8 @@ update_site_properties() {
     fi
     
     # Ensure directory exists
-    mkdir -p "$(dirname "$UBA_SITE_PROPERTIES")"
+    sudo mkdir -p "$(dirname "$UBA_SITE_PROPERTIES")"
+    sudo chown caspida:caspida "$(dirname "$UBA_SITE_PROPERTIES")" 2>/dev/null || true
     
     # Create or update properties file
     if [[ ! -f "$UBA_SITE_PROPERTIES" ]]; then
@@ -1061,29 +1197,285 @@ EOF
 # Service management functions
 ###############################################################################
 
-sync_cluster_config() {
-    log "Synchronizing cluster configuration..."
+# UBA service names for systemd management
+declare -a UBA_SYSTEMD_SERVICES=("caspida-jobmanager" "caspida-ui" "caspida-resourcesmonitor")
+
+# Global variable to track which service management method is actually being used
+SERVICE_MANAGEMENT_METHOD=""
+
+# Function to check if UBA is managed via systemd
+check_systemd_management() {
+    # First check if systemd services are actually active
+    local active_systemd_services=0
+    for service in "${UBA_SYSTEMD_SERVICES[@]}"; do
+        if systemctl is-active --quiet "$service" 2>/dev/null; then
+            ((active_systemd_services++))
+        fi
+    done
     
-    if [[ "$DRY_RUN" == "true" ]]; then
-        log "DRY RUN: Would sync cluster configuration"
+    # If any systemd services are active, we're using systemd
+    if [[ $active_systemd_services -gt 0 ]]; then
+        log "Detected active systemd service management for UBA"
+        SERVICE_MANAGEMENT_METHOD="systemd"
         return 0
     fi
     
-    # Sync site properties
-    if [[ -f "/opt/caspida/bin/Caspida" ]]; then
-        sudo -u caspida /opt/caspida/bin/Caspida sync-cluster /etc/caspida/local/conf 2>/dev/null || {
-            log_warn "Failed to sync cluster configuration - may be single node deployment"
-        }
-        
-        # Sync job configuration if Job Manager certs were updated
-        if [[ "$INSTALL_JM_CERTS" == "true" ]]; then
-            sudo -u caspida /opt/caspida/bin/Caspida sync-cluster /etc/caspida/conf/jobconf/ 2>/dev/null || {
-                log_warn "Failed to sync job configuration"
-            }
-        fi
+    # Check if systemd services are available but not active
+    if systemctl list-units --type=service --all 2>/dev/null | grep -q caspida; then
+        log "Systemd services are available but not active - will use systemd"
+        SERVICE_MANAGEMENT_METHOD="systemd"
+        return 0
     fi
+    
+    # Default to traditional management
+    log "Using traditional script management for UBA"
+    SERVICE_MANAGEMENT_METHOD="traditional"
+    return 1
 }
 
+# Function to stop UBA services intelligently
+stop_uba_services() {
+    log "Stopping UBA services..."
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log "DRY RUN: Would stop UBA services"
+        return 0
+    fi
+    
+    # Check current service status first
+    log "Checking current service status before stopping..."
+    if check_systemd_management; then
+        local running_services=0
+        for service in "${UBA_SYSTEMD_SERVICES[@]}"; do
+            if systemctl is-active --quiet "$service" 2>/dev/null; then
+                ((running_services++))
+            fi
+        done
+        
+        if [[ $running_services -eq 0 ]]; then
+            log "All systemd services are already stopped"
+            return 0
+        fi
+        
+        log "Stopping UBA services via systemd..."
+        local stop_errors=0
+        
+        for service in "${UBA_SYSTEMD_SERVICES[@]}"; do
+            if systemctl is-active --quiet "$service" 2>/dev/null; then
+                log "Stopping $service..."
+                if ! sudo systemctl stop "$service" 2>/dev/null; then
+                    log_warn "Failed to stop $service via systemctl"
+                    ((stop_errors++))
+                else
+                    log "Successfully stopped $service"
+                fi
+            else
+                log "Service $service is already inactive"
+            fi
+        done
+        
+        if [[ $stop_errors -gt 0 ]]; then
+            log_warn "$stop_errors service(s) failed to stop via systemctl"
+            return 1
+        fi
+    else
+        # Check if services are running via traditional method
+        if [[ -x "/opt/caspida/bin/Caspida" ]]; then
+            log "Checking current UBA service status..."
+            if /opt/caspida/bin/Caspida status >/dev/null 2>&1; then
+                local services_running=true
+            else
+                local services_running=false
+            fi
+            
+            if [[ "$services_running" == "false" ]]; then
+                log "UBA services appear to be already stopped"
+                return 0
+            fi
+            
+            log "Stopping UBA services via traditional scripts..."
+            log "Executing: /opt/caspida/bin/Caspida stop-all"
+            if ! /opt/caspida/bin/Caspida stop-all; then
+                log_warn "Failed to stop UBA services via Caspida script"
+                return 1
+            else
+                log "Successfully stopped UBA services via Caspida script"
+            fi
+        else
+            log_error "Caspida management script not found at /opt/caspida/bin/Caspida"
+            return 1
+        fi
+    fi
+    
+    # Wait for services to fully stop
+    log "Waiting for services to fully stop..."
+    sleep 10
+    
+    # Verify services are actually stopped
+    log "Verifying services are stopped..."
+    if check_systemd_management; then
+        local still_running=0
+        for service in "${UBA_SYSTEMD_SERVICES[@]}"; do
+            if systemctl is-active --quiet "$service" 2>/dev/null; then
+                log_warn "$service is still running"
+                ((still_running++))
+            fi
+        done
+        
+        if [[ $still_running -gt 0 ]]; then
+            log_warn "$still_running service(s) are still running after stop attempt"
+            return 1
+        fi
+    else
+        if /opt/caspida/bin/Caspida status >/dev/null 2>&1; then
+            log_warn "Some UBA services may still be running"
+            return 1
+        fi
+    fi
+    
+    log "All UBA services stopped successfully"
+    return 0
+}
+
+# Function to start UBA services intelligently  
+start_uba_services() {
+    log "Starting UBA services..."
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log "DRY RUN: Would start UBA services"
+        return 0
+    fi
+    
+    # Check current service status first
+    log "Checking current service status before starting..."
+    if check_systemd_management; then
+        local stopped_services=0
+        for service in "${UBA_SYSTEMD_SERVICES[@]}"; do
+            if ! systemctl is-active --quiet "$service" 2>/dev/null; then
+                ((stopped_services++))
+            fi
+        done
+        
+        if [[ $stopped_services -eq 0 ]]; then
+            log "All systemd services are already running"
+            return 0
+        fi
+        
+        log "Starting UBA services via systemd..."
+        local start_errors=0
+        
+        for service in "${UBA_SYSTEMD_SERVICES[@]}"; do
+            if ! systemctl is-active --quiet "$service" 2>/dev/null; then
+                log "Starting $service..."
+                if ! sudo systemctl start "$service" 2>/dev/null; then
+                    log_warn "Failed to start $service via systemd"
+                    ((start_errors++))
+                else
+                    log "Successfully started $service"
+                fi
+            else
+                log "Service $service is already active"
+            fi
+        done
+        
+        if [[ $start_errors -gt 0 ]]; then
+            log_warn "$start_errors service(s) failed to start via systemd"
+            return 1
+        fi
+    else
+        # Check if services are already running via traditional method
+        if [[ -x "/opt/caspida/bin/Caspida" ]]; then
+            log "Checking current UBA service status..."
+            if /opt/caspida/bin/Caspida status >/dev/null 2>&1; then
+                local services_running=true
+            else
+                local services_running=false
+            fi
+            
+            if [[ "$services_running" == "true" ]]; then
+                log "UBA services appear to be already running"
+                return 0
+            fi
+            
+            log "Starting UBA services via traditional scripts..."
+            log "Executing: /opt/caspida/bin/Caspida start-all"
+            
+            # Capture output for debugging
+            local start_output
+            if start_output=$(/opt/caspida/bin/Caspida start-all 2>&1); then
+                log "Successfully started UBA services via Caspida script"
+                log_debug "Start output: $start_output"
+                SERVICE_MANAGEMENT_METHOD="traditional"
+            else
+                local exit_code=$?
+                log_warn "UBA services start command exited with code: $exit_code"
+                log_debug "Start output: $start_output"
+                # Don't fail immediately - services might still be starting
+                SERVICE_MANAGEMENT_METHOD="traditional"
+            fi
+        else
+            log_error "Caspida management script not found at /opt/caspida/bin/Caspida"
+            return 1
+        fi
+    fi
+    
+    # Wait longer for services to fully start (UBA services take time)
+    log "Waiting for services to fully start (this may take several minutes)..."
+    sleep 30
+    
+    # Additional verification attempts with retries
+    local verification_attempts=3
+    local attempt=1
+    
+    while [[ $attempt -le $verification_attempts ]]; do
+        log "Verifying services are running (attempt $attempt/$verification_attempts)..."
+        
+        if [[ "$SERVICE_MANAGEMENT_METHOD" == "systemd" ]]; then
+            local not_running=0
+            for service in "${UBA_SYSTEMD_SERVICES[@]}"; do
+                if ! systemctl is-active --quiet "$service" 2>/dev/null; then
+                    log_warn "$service is not yet running"
+                    ((not_running++))
+                fi
+            done
+            
+            if [[ $not_running -eq 0 ]]; then
+                log "All systemd services are running"
+                break
+            elif [[ $attempt -eq $verification_attempts ]]; then
+                log_warn "$not_running systemd service(s) failed to start properly after $verification_attempts attempts"
+                return 1
+            fi
+        else
+            # Traditional management - check via Caspida script
+            if /opt/caspida/bin/Caspida status >/dev/null 2>&1; then
+                log "UBA services verification successful via traditional method"
+                break
+            elif [[ $attempt -eq $verification_attempts ]]; then
+                log_warn "UBA services may not have started properly after $verification_attempts attempts (traditional method)"
+                log "Checking detailed status..."
+                /opt/caspida/bin/Caspida status || true
+                return 1
+            fi
+        fi
+        
+        log "Services still starting, waiting additional 30 seconds..."
+        sleep 30
+        ((attempt++))
+    done
+    
+    log "All UBA services started successfully"
+    
+    # Post-startup keystore sync if UBA keystore was modified
+    if [[ "$INSTALL_UBA_KEYSTORE" == "true" && "$DRY_RUN" == "false" ]]; then
+        log "Running post-startup UBA keystore sync..."
+        post_startup_keystore_sync
+    fi
+    
+    return 0
+}
+
+# Function to restart UBA services intelligently
 restart_uba_services() {
     log "Restarting UBA services..."
     
@@ -1092,84 +1484,125 @@ restart_uba_services() {
         return 0
     fi
     
-    local services_to_restart=()
-    
-    if [[ "$INSTALL_UI_CERTS" == "true" ]]; then
-        services_to_restart+=("caspida-ui" "caspida-resourcesmonitor")
+    if ! stop_uba_services; then
+        log_warn "Failed to stop UBA services, attempting to start anyway"
     fi
     
-    if [[ "$INSTALL_JM_CERTS" == "true" ]]; then
-        services_to_restart+=("caspida-jobmanager")
-    fi
-    
-    # Start services (they were already stopped before certificate installation)
-    for service in "${services_to_restart[@]}"; do
-        log "Starting service: $service"
-        systemctl start "$service" 2>/dev/null || {
-            service "$service" start 2>/dev/null || log_error "Failed to start $service"
-        }
-    done
-    
-    log "Service restart completed"
-}
-
-stop_uba_services() {
-    log "Stopping UBA services before certificate installation..."
-    
-    if [[ "$DRY_RUN" == "true" ]]; then
-        log "DRY RUN: Would stop UBA services"
-        return 0
-    fi
-    
-    local services_to_stop=()
-    
-    if [[ "$INSTALL_UI_CERTS" == "true" ]]; then
-        services_to_stop+=("caspida-ui" "caspida-resourcesmonitor")
-    fi
-    
-    if [[ "$INSTALL_JM_CERTS" == "true" ]]; then
-        services_to_stop+=("caspida-jobmanager")
-    fi
-    
-    # Stop services before certificate installation (per Splunk docs)
-    for service in "${services_to_stop[@]}"; do
-        log "Stopping service: $service"
-        systemctl stop "$service" 2>/dev/null || {
-            service "$service" stop 2>/dev/null || log_warn "Failed to stop $service"
-        }
-    done
-    
-    # Small delay to ensure clean shutdown
+    # Additional wait between stop and start
+    log "Waiting between stop and start operations..."
     sleep 5
     
-    log "Service stop completed"
+    if ! start_uba_services; then
+        log_error "Failed to start UBA services after restart"
+        return 1
+    fi
+    
+    log "UBA services restarted successfully"
+    return 0
 }
 
-set_certificate_ownership() {
-    local cert_dir="$1"
+# Function to check UBA service status
+check_uba_service_status() {
+    log "Checking UBA service status..."
     
-    log "Setting proper ownership and permissions for certificate files..."
+    # Use the tracked service management method if available, otherwise detect
+    local method_to_use="$SERVICE_MANAGEMENT_METHOD"
+    if [[ -z "$method_to_use" ]]; then
+        if check_systemd_management; then
+            method_to_use="systemd"
+        else
+            method_to_use="traditional"
+        fi
+    fi
+    
+    if [[ "$method_to_use" == "systemd" ]]; then
+        log "Checking UBA service status via systemd..."
+        local inactive_services=0
+        
+        for service in "${UBA_SYSTEMD_SERVICES[@]}"; do
+            if systemctl is-active --quiet "$service" 2>/dev/null; then
+                log "✓ $service: active"
+            else
+                log "✗ $service: inactive"
+                ((inactive_services++))
+            fi
+        done
+        
+        if [[ $inactive_services -eq 0 ]]; then
+            log "All UBA services are running"
+            return 0
+        else
+            log_warn "$inactive_services UBA service(s) are inactive"
+            return 1
+        fi
+    else
+        log "Checking UBA service status via traditional scripts..."
+        if [[ -x "/opt/caspida/bin/Caspida" ]]; then
+            log "Executing: /opt/caspida/bin/Caspida status"
+            if /opt/caspida/bin/Caspida status; then
+                log "UBA services status check completed"
+                return 0
+            else
+                log_warn "UBA services status check indicated issues"
+                return 1
+            fi
+        else
+            log_error "Caspida management script not found at /opt/caspida/bin/Caspida"
+            return 1
+        fi
+    fi
+}
+
+# Function to sync UBA keystore after services are started
+post_startup_keystore_sync() {
+    log "Performing post-startup UBA keystore synchronization..."
+    
+    if [[ -x "/opt/caspida/bin/Caspida" ]]; then
+        # Wait a bit for services to fully initialize
+        log "Waiting for services to fully initialize before keystore sync..."
+        sleep 10
+        
+        # Set proper environment for keytool
+        export JAVA_HOME="$JAVA_HOME"
+        export PATH="$JAVA_HOME/bin:$PATH"
+        
+        log "Executing: /opt/caspida/bin/Caspida setup-uba-keystore"
+        if sudo -u caspida env JAVA_HOME="$JAVA_HOME" PATH="$JAVA_HOME/bin:$PATH" /opt/caspida/bin/Caspida setup-uba-keystore 2>&1; then
+            log "Post-startup UBA keystore sync completed successfully"
+        else
+            log_warn "Post-startup UBA keystore sync had warnings - this may be normal"
+            log_warn "Manual verification recommended: /opt/caspida/bin/Caspida setup-uba-keystore"
+        fi
+    else
+        log_warn "Caspida management script not found for post-startup keystore sync"
+    fi
+}
+
+# Function to sync cluster configuration across UBA nodes
+sync_cluster_config() {
+    log "Syncing cluster configuration..."
     
     if [[ "$DRY_RUN" == "true" ]]; then
-        log "DRY RUN: Would set certificate ownership and permissions"
+        log "DRY RUN: Would sync cluster configuration"
         return 0
     fi
     
-    # Set ownership to caspida:caspida for all certificate files
-    if [[ -d "$cert_dir" ]]; then
-        chown -R caspida:caspida "$cert_dir" 2>/dev/null || {
-            log_warn "Failed to set ownership on some files in $cert_dir"
-        }
+    # Check if this is a multi-node cluster
+    if [[ -f "/etc/caspida/local/conf/cluster.conf" ]]; then
+        log "Multi-node cluster detected, syncing configuration..."
         
-        # Set proper permissions per Splunk documentation
-        find "$cert_dir" -type f -name "*.pem" -exec chmod 644 {} \; 2>/dev/null || true
-        find "$cert_dir" -type f -name "*.crt" -exec chmod 644 {} \; 2>/dev/null || true
-        find "$cert_dir" -type f -name "*.key" -exec chmod 600 {} \; 2>/dev/null || true
-        find "$cert_dir" -type f -name "*.p12" -exec chmod 600 {} \; 2>/dev/null || true
-        
-        log "Certificate ownership and permissions set successfully"
+        if [[ -x "/opt/caspida/bin/Caspida" ]]; then
+            log "Executing: /opt/caspida/bin/Caspida sync-cluster /etc/caspida/local/conf"
+            if /opt/caspida/bin/Caspida sync-cluster /etc/caspida/local/conf 2>/dev/null; then
+                log "Cluster configuration synced successfully"
+            else
+                log_warn "Failed to sync cluster configuration (may not be needed for single-node)"
+            fi
+        else
+            log_warn "Caspida management script not found, skipping cluster sync"
+        fi
     else
-        log_warn "Certificate directory not found: $cert_dir"
+        log "Single-node deployment detected, skipping cluster sync"
     fi
 }
 
@@ -1249,8 +1682,221 @@ process_certificates() {
     log "Certificate processing completed"
 }
 
+# Function to test keystore access and validate keystore operations
+test_keystore_access() {
+    local keystore_file="$1"
+    local keystore_pass="$2"
+    local description="$3"
+    
+    if [[ -z "$keystore_file" || -z "$keystore_pass" ]]; then
+        log_error "Keystore file and password required for testing"
+        return 1
+    fi
+    
+    log "Testing $description keystore access: $keystore_file"
+    
+    # Check if keystore file exists
+    if [[ ! -f "$keystore_file" ]]; then
+        log_error "Keystore file not found: $keystore_file"
+        return 1
+    fi
+    
+    # Check read permissions
+    if [[ ! -r "$keystore_file" ]]; then
+        log_error "Cannot read keystore file: $keystore_file"
+        return 1
+    fi
+    
+    # Test keystore access with keytool
+    if ! "$JAVA_HOME/bin/keytool" -list -keystore "$keystore_file" -storepass "$keystore_pass" -noprompt >/dev/null 2>&1; then
+        log_error "Cannot access $description keystore with provided password"
+        return 1
+    fi
+    
+    # Check write permissions if needed
+    if [[ -w "$keystore_file" ]]; then
+        log_debug "$description keystore has write access"
+        export KEYSTORE_NEEDS_SUDO=false
+    else
+        # Test with sudo
+        if sudo test -w "$keystore_file" 2>/dev/null; then
+            log "$description keystore requires sudo for write access"
+            export KEYSTORE_NEEDS_SUDO=true
+        else
+            log_error "Cannot write to $description keystore even with sudo"
+            return 1
+        fi
+    fi
+    
+    log "$description keystore access verified successfully"
+    return 0
+}
+
+# Function to test all UBA keystores
+test_all_uba_keystores() {
+    log "Testing access to all UBA keystores..."
+    
+    local keystore_errors=0
+    
+    # Test Job Manager keystore
+    if [[ -f "/etc/caspida/conf/jobconf/keystore.jm" ]]; then
+        if ! test_keystore_access "/etc/caspida/conf/jobconf/keystore.jm" "password" "Job Manager"; then
+            ((keystore_errors++))
+        fi
+    else
+        log_warn "Job Manager keystore not found: /etc/caspida/conf/jobconf/keystore.jm"
+    fi
+    
+    # Test UBA internal keystore
+    if [[ -f "/etc/caspida/conf/keystore/uba-keystore" ]]; then
+        # Try to get the UBA keystore password from configuration
+        local uba_keystore_pass="changeit"  # Default password
+        if [[ -f "/etc/caspida/local/conf/caspida.conf" ]]; then
+            local configured_pass=$(grep -E "^\s*uba\.keystore\.password\s*=" /etc/caspida/local/conf/caspida.conf 2>/dev/null | cut -d'=' -f2 | tr -d ' ')
+            if [[ -n "$configured_pass" ]]; then
+                uba_keystore_pass="$configured_pass"
+            fi
+        fi
+        
+        if ! test_keystore_access "/etc/caspida/conf/keystore/uba-keystore" "$uba_keystore_pass" "UBA Internal"; then
+            ((keystore_errors++))
+        fi
+    else
+        log_warn "UBA internal keystore not found: /etc/caspida/conf/keystore/uba-keystore"
+    fi
+    
+    # Test Java cacerts (already tested in check_java_cacerts_access)
+    if [[ -f "$JAVA_CACERTS" ]]; then
+        if ! test_keystore_access "$JAVA_CACERTS" "changeit" "Java cacerts"; then
+            ((keystore_errors++))
+        fi
+    fi
+    
+    if [[ $keystore_errors -eq 0 ]]; then
+        log "All UBA keystores accessible"
+        return 0
+    else
+        log_warn "$keystore_errors keystore(s) have access issues"
+        return 1
+    fi
+}
+
+# Function to verify keystore contents and certificates
+verify_keystore_certificates() {
+    local keystore_file="$1"
+    local keystore_pass="$2"
+    local description="$3"
+    
+    if [[ ! -f "$keystore_file" ]]; then
+        log_warn "Cannot verify $description keystore - file not found: $keystore_file"
+        return 1
+    fi
+    
+    log "Verifying $description keystore certificates..."
+    
+    # Get certificate count
+    local cert_count
+    if cert_count=$("$JAVA_HOME/bin/keytool" -list -keystore "$keystore_file" -storepass "$keystore_pass" -noprompt 2>/dev/null | grep -c "Certificate fingerprint"); then
+        log "$description keystore contains $cert_count certificate(s)"
+        
+        # List certificate aliases if verbose mode
+        if [[ "$VERBOSE" == "true" ]]; then
+            log_debug "$description keystore certificate details:"
+            "$JAVA_HOME/bin/keytool" -list -keystore "$keystore_file" -storepass "$keystore_pass" -noprompt 2>/dev/null | grep -E "Alias name:|Certificate fingerprint:" | head -20
+        fi
+        
+        return 0
+    else
+        log_warn "Could not verify certificates in $description keystore"
+        return 1
+    fi
+}
+
+# Function to run enhanced UBA keystore setup with proper environment
+enhanced_setup_uba_keystore() {
+    log "Running enhanced UBA keystore setup..."
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log "DRY RUN: Would run enhanced UBA keystore setup"
+        return 0
+    fi
+    
+    # Ensure JAVA_HOME is properly set in environment
+    export JAVA_HOME="$JAVA_HOME"
+    export PATH="$JAVA_HOME/bin:$PATH"
+    
+    # Test if keytool is accessible
+    if ! command -v keytool >/dev/null 2>&1; then
+        log_error "keytool command not found in PATH. Current PATH: $PATH"
+        log_error "JAVA_HOME: $JAVA_HOME"
+        return 1
+    fi
+    
+    # Test keystore access before running setup
+    if ! test_all_uba_keystores; then
+        log_warn "Some keystores have access issues, but proceeding with setup"
+    fi
+    
+    # Run the UBA keystore setup with proper environment
+    log "Executing: /opt/caspida/bin/Caspida setup-uba-keystore"
+    if env JAVA_HOME="$JAVA_HOME" PATH="$JAVA_HOME/bin:$PATH" /opt/caspida/bin/Caspida setup-uba-keystore 2>&1; then
+        log "UBA keystore setup completed successfully"
+        
+        # Verify keystore after setup
+        log "Verifying keystores after setup..."
+        verify_keystore_certificates "/etc/caspida/conf/keystore/uba-keystore" "changeit" "UBA Internal"
+        
+        return 0
+    else
+        log_warn "UBA keystore setup reported errors (may be non-critical)"
+        
+        # Still verify what we can
+        verify_keystore_certificates "/etc/caspida/conf/keystore/uba-keystore" "changeit" "UBA Internal"
+        
+        return 1
+    fi
+}
+
+# Function to set proper ownership and permissions for certificate files
+set_certificate_ownership() {
+    local cert_dir="$1"
+    
+    if [[ -z "$cert_dir" ]]; then
+        log_error "Certificate directory not specified for ownership setting"
+        return 1
+    fi
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log "DRY RUN: Would set certificate ownership for: $cert_dir"
+        return 0
+    fi
+    
+    if [[ -d "$cert_dir" ]]; then
+        log "Setting proper ownership and permissions for certificate files in: $cert_dir"
+        
+        # Set ownership to caspida:caspida for certificate files
+        if sudo chown -R caspida:caspida "$cert_dir" 2>/dev/null; then
+            log "Certificate directory ownership set to caspida:caspida"
+        else
+            log_warn "Failed to set ownership for certificate directory (may not have sufficient privileges)"
+        fi
+        
+        # Set secure permissions: 640 for files, 750 for directories
+        if find "$cert_dir" -type f -exec chmod 640 {} \; 2>/dev/null && \
+           find "$cert_dir" -type d -exec chmod 750 {} \; 2>/dev/null; then
+            log "Certificate file permissions set: files=640, dirs=750"
+        else
+            log_warn "Failed to set some permissions for certificate files"
+        fi
+        
+        log "Certificate ownership and permissions set successfully"
+    else
+        log_warn "Certificate directory not found: $cert_dir"
+    fi
+}
+
 ###############################################################################
-# Main script execution
+# Main function with argument parsing and execution
 ###############################################################################
 
 main() {
@@ -1265,23 +1911,26 @@ main() {
                 CUSTOM_JAVA_HOME="$2"
                 shift 2
                 ;;
-            --no-pkcs12)
-                GENERATE_PKCS12=false
-                shift
-                ;;
-            --pkcs12-password)
-                PKCS12_PASSWORD="$2"
+            --pull-from)
+                IFS=',' read -ra HOSTS_ARRAY <<< "$2"
+                for host in "${HOSTS_ARRAY[@]}"; do
+                    SPLUNK_HOSTS+=("$host")
+                done
                 shift 2
                 ;;
-            --no-ui-certs)
+            --test-connectivity)
+                TEST_CONNECTIVITY=true
+                shift
+                ;;
+            --no-ui)
                 INSTALL_UI_CERTS=false
                 shift
                 ;;
-            --no-jm-certs)
+            --no-jm)
                 INSTALL_JM_CERTS=false
                 shift
                 ;;
-            --no-search-head-certs)
+            --no-search-head)
                 INSTALL_SEARCH_HEAD_CERTS=false
                 shift
                 ;;
@@ -1289,7 +1938,7 @@ main() {
                 INSTALL_UBA_KEYSTORE=false
                 shift
                 ;;
-            --enable-kafka-certs)
+            --kafka-certs)
                 INSTALL_KAFKA_CERTS=true
                 shift
                 ;;
@@ -1299,14 +1948,6 @@ main() {
                 ;;
             --no-restart)
                 RESTART_SERVICES=false
-                shift
-                ;;
-            --pull-from)
-                SPLUNK_HOSTS+=("$2")
-                shift 2
-                ;;
-            --test-connectivity)
-                TEST_CONNECTIVITY=true
                 shift
                 ;;
             --dry-run)
@@ -1321,7 +1962,11 @@ main() {
                 usage
                 exit 0
                 ;;
-            *)
+            --)
+                shift
+                break
+                ;;
+            -*)
                 print_error "Unknown option: $1"
                 usage
                 exit 1
@@ -1365,6 +2010,7 @@ main() {
         
         # Test connectivity if requested
         if [[ "$TEST_CONNECTIVITY" == "true" ]]; then
+           
             log "Testing connectivity to Splunk instances..."
             if ! validate_splunk_connectivity "${SPLUNK_HOSTS[@]}"; then
                 if [[ "$DRY_RUN" == "false" ]]; then
@@ -1388,7 +2034,19 @@ main() {
     check_prerequisites
     process_certificates
     
-    print_success "Certificate installation completed successfully"
+    # Check final service status if services were restarted
+    if [[ "$RESTART_SERVICES" == "true" ]] && [[ "$DRY_RUN" == "false" ]]; then
+        log "Performing final service status check..."
+        if check_uba_service_status; then
+            print_success "Certificate installation completed successfully - All services are running"
+        else
+            print_warning "Certificate installation completed but some services may not be running properly"
+            log_warn "Please check service status manually and review logs"
+        fi
+    else
+        print_success "Certificate installation completed successfully"
+    fi
+    
     log "Script execution completed"
     
     # Display next steps

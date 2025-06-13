@@ -4,6 +4,7 @@ Comprehensive certificate management tools for Splunk UBA (User Behavior Analyti
 
 ## Features
 
+- **Certificate Diagnostics** - Comprehensive read-only analysis of certificate health and PKIX issues
 - **Automated Certificate Installation** - Install SSL/TLS certificates for UBA instances with full keystore management
 - **Remote Certificate Pulling** - Pull certificates from remote Splunk instances via HTTPS
 - **Certificate Validation** - Comprehensive validation and testing of installed certificates
@@ -14,6 +15,20 @@ Comprehensive certificate management tools for Splunk UBA (User Behavior Analyti
 - **Backup and Recovery** - Automatic backup of existing certificates and configurations
 
 ## Quick Start
+
+### Diagnose Certificate Issues
+
+```bash
+# Comprehensive certificate and service diagnostics (read-only)
+./scripts/diagnose_uba_certificates.sh
+
+# Shows:
+# - Java environment and keystore access
+# - UBA service management detection (systemd vs traditional)
+# - Certificate validity and PKIX error analysis
+# - Endpoint connectivity and health checks
+# - Recent error analysis from JobManager logs
+```
 
 ### Install Certificates
 
@@ -57,6 +72,7 @@ Comprehensive certificate management tools for Splunk UBA (User Behavior Analyti
 
 | Script | Description |
 |--------|-------------|
+| `diagnose_uba_certificates.sh` | Comprehensive certificate and service diagnostics (read-only) |
 | `install_uba_certs.sh` | Main certificate installation script with full UBA integration |
 | `validate_uba_certs.sh` | Certificate validation and testing utility |
 | `generate_test_certs.sh` | Test certificate generation with proper SANs |
