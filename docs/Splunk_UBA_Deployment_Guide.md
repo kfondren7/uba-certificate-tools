@@ -83,6 +83,8 @@ Configure firewall rules to allow the following ports:
    sudo firewall-cmd --reload
    ```
 
+## 3. Pre-Installation Tasks
+
 ### Configure Permissions and Prepare the User
 1. Add the caspida user:
    ```bash
@@ -198,7 +200,7 @@ Configure firewall rules to allow the following ports:
    echo net.bridge.bridge-nf-call-iptables=1 > /etc/sysctl.d/splunkuba-bridge.conf
    ```
 
-## 3. Installation
+## 4. Installation
 
 ### Obtain and Prepare Installation Package
 1. Download UBA software package:
@@ -255,7 +257,7 @@ Configure firewall rules to allow the following ports:
    ./INSTALL.sh -n
    ```
 
-## 4. Post-Installation Configuration
+## 5. Post-Installation Configuration
 
 ### Verify Installation
 1. Access the Splunk UBA web interface: `https://<ip_address>`
@@ -267,7 +269,7 @@ Configure firewall rules to allow the following ports:
 
 ### Secure Default Account
 1. Change the admin password:
-   ```bash
+   ```
    # Log in to Splunk UBA UI
    # Go to Manage > UBA Accounts
    # Edit the admin user and change password
@@ -289,43 +291,7 @@ Configure firewall rules to allow the following ports:
   sudo service caspida-ui restart
   ```
 
-## 5. Data Sources Configuration
-
-### Connect to Splunk Enterprise
-1. Configure Splunk Enterprise connection:
-   - Go to UBA UI > Data Sources
-   - Add "Splunk Data Source"
-   - Provide Splunk host, port, username, password
-   - Test the connection
-
-2. Configure data sources for essential data:
-   - **HR Data**: First priority data source
-     - Connect and map user fields properly
-   
-   - **Asset Data**: Second priority data source
-     - Connect and ensure proper device-to-user mapping
-
-   - **Authentication Data**: Critical for threat detection
-     - Configure authentication logs from AD, LDAP, etc.
-   
-   - **VPN Data**: For remote access monitoring
-   
-   - **Proxy/Web Data**: For web activity analysis
-
-### Configure Splunk UBA Properties
-Edit the `/etc/caspida/local/conf/uba-site.properties` file and synchronize across cluster:
-
-```bash
-# After editing the file, run:
-/opt/caspida/bin/Caspida sync-cluster /etc/caspida/local/conf
-```
-
-Key properties to consider:
-- `splunk.live.micro.batching.delay.seconds=180` - Configures data ingestion delay
-- `splunk.live.micro.batching.interval.seconds=60` - Configures micro batch interval
-- `connector.splunk.max.backtrace.time.in.hour=4` - Sets data backfill window
-
-## 10. SSL Certificate Management
+## 6. Configure Splunk UBA
 
 ### Upload Splunk UBA License
 After installation, you must upload a valid license file:
@@ -364,7 +330,166 @@ Federal Information Processing Standard (FIPS) compliance is available for UBA 5
 
 **Note:** Enable FIPS on each UBA node before running installation/upgrade scripts.
 
-## 7. User Management and Authentication
+### SSL Certificate Management
+
+#### Updating the Default Self-Signed Certificate
+The self-signed certificate included with Splunk UBA expires 365 days after the Splunk UBA web interface is accessed for the first time.
+
+1. Regenerate the default self-signed certificate:
+   ```bash
+   rm /var/vcap/store/caspida/certs/my-root-ca.crt.pem
+   /opt/caspida/bin/CaspidaCert.sh US CA "San Francisco" Splunk "" "" /var/vcap/store/caspida/certs/
+   ```
+
+#### Creating and Installing Third-Party Certificates
+For production environments, you should replace the self-signed certificate with a third-party signed certificate.
+
+##### Generate a Certificate Signing Request (CSR)
+
+1. Stop the Splunk UBA services:
+   ```bash
+   sudo service caspida-resourcesmonitor stop
+   sudo service caspida-ui stop
+   ```
+
+2. Get host information:
+   ```bash
+   hostname -s  # Short hostname
+   hostname -d  # Domain name
+   ```
+
+3. Generate certificates:
+   ```bash
+   sudo /opt/caspida/bin/CaspidaCert.sh <country> <state> <location> <org> <domain> <"short hostname"> /var/vcap/store/caspida/certs/mycerts
+   ```
+   Example:
+   ```bash
+   sudo /opt/caspida/bin/CaspidaCert.sh US CA SanFrancisco Splunk sv.splunk.com "uba-17" /var/vcap/store/caspida/certs/mycerts
+   ```
+
+4. Update uba-site.properties:
+   ```bash
+   # Add the following to /etc/caspida/local/conf/uba-site.properties
+   ui.auth.rootca=/var/vcap/store/caspida/certs/mycerts/my-root-ca.crt.pem
+   ui.auth.privateKey=/var/vcap/store/caspida/certs/mycerts/my-server.key.pem
+   ui.auth.serverCert=/var/vcap/store/caspida/certs/mycerts/my-server.crt.pem
+   ```
+
+5. Generate CSR for the certificate authority:
+   ```bash
+   cd /var/vcap/store/caspida/certs/mycerts
+   sudo openssl req -new -key my-server.key.pem -out myCACertificate.csr
+   ```
+
+6. Set permissions:
+   ```bash
+   sudo chmod 644 /var/vcap/store/caspida/certs/mycerts/*
+   ```
+
+7. Start services:
+   ```bash
+   sudo service caspida-ui start
+   sudo service caspida-resourcesmonitor start
+   ```
+
+8. Submit the CSR to your certificate authority and obtain signed certificates.
+
+#### Installing Third-Party Signed Certificates
+
+1. Stop services:
+   ```bash
+   sudo service caspida-resourcesmonitor stop
+   sudo service caspida-ui stop
+   ```
+
+2. Back up existing certificates:
+   ```bash
+   sudo cp -p /var/vcap/store/caspida/certs/my-server.crt.pem /var/vcap/store/caspida/certs/my-server.crt.pem_backup
+   sudo cp -p /var/vcap/store/caspida/certs/my-root-ca.crt.pem /var/vcap/store/caspida/certs/my-root-ca.crt.pem_backup
+   ```
+
+3. Install new certificates:
+   ```bash
+   sudo mv -f /path/to/your/signed/certificate.pem /var/vcap/store/caspida/certs/mycerts/my-server.crt.pem
+   sudo mv -f /path/to/your/root/certificate.pem /var/vcap/store/caspida/certs/mycerts/my-root-ca.crt.pem
+   ```
+
+4. Set permissions:
+   ```bash
+   sudo chmod 644 /var/vcap/store/caspida/certs/mycerts/*
+   ```
+
+5. For distributed deployments, synchronize configuration:
+   ```bash
+   /opt/caspida/bin/Caspida sync-cluster /etc/caspida/local/conf
+   ```
+
+6. Start services:
+   ```bash
+   sudo service caspida-ui start
+   sudo service caspida-resourcesmonitor start
+   ```
+
+7. Verify certificate installation by accessing the UBA web interface.
+
+#### Handling Subject Alternative Names (SAN)
+If Chrome reports ERR_CERT_COMMON_NAME_INVALID, you need to include Subject Alternative Names:
+
+1. Create directory and configuration:
+   ```bash
+   mkdir -p /opt/caspida/conf/deployment/templates/local_conf/ssl
+   ```
+
+2. Create openssl-altname.cnf:
+   ```bash
+   cat > /opt/caspida/conf/deployment/templates/local_conf/ssl/openssl-altname.cnf << 'EOF'
+   [ req ]
+   default_bits       = 2048
+   distinguished_name = req_distinguished_name
+   attributes        = req_attributes
+   [ req_distinguished_name ]
+   countryName                = Country Name (2 letter code)
+   stateOrProvinceName        = State or Province Name (full name)
+   localityName               = Locality Name (eg, city)
+   organizationName           = Organization Name (eg, company)
+   organizationalUnitName     = Organizational Unit Name (eg, section)
+   commonName                 = Common Name (e.g. server FQDN or YOUR name)
+   [req_attributes]
+   subjectAltName             = Alternative DNS names, Email adresses or IPs (comma separated)
+   EOF
+   ```
+
+3. Generate CSR with SANs:
+   ```bash
+   openssl req -sha256 -new -key my-server.key.pem -out myCACertificate.csr -config /opt/caspida/conf/deployment/templates/local_conf/ssl/openssl-altname.cnf
+   ```
+   When prompted for alternative names, enter: `DNS:hostname.domain.com, DNS:hostname, IP:192.168.0.1`
+
+4. Verify SANs in the CSR:
+   ```bash
+   openssl req -text -noout -verify -in myCACertificate.csr | grep DNS
+   ```
+
+#### Replace Job Manager Certificate
+For communication between UBA components:
+
+1. Stop services:
+   ```bash
+   /opt/caspida/bin/Caspida stop
+   ```
+
+2. Generate the keystore:
+   ```bash
+   cd /opt/caspida/bin/jobmanager
+   sudo ./generate-keystore.sh
+   ```
+
+3. Start services:
+   ```bash
+   /opt/caspida/bin/Caspida start
+   ```
+
+## 7. Manage User Accounts and Authentication
 
 ### User Account Roles
 UBA supports multiple user roles with different privilege levels:
@@ -420,9 +545,122 @@ For Splunk Enterprise/Cloud integration:
    # Test connection
    ```
 
-## 8. Health Monitoring and Performance Optimization
+## 8. Backup and Restore Configuration
 
-### Monitor UBA Health
+### Configure Automated Incremental Backups
+For disaster recovery and high availability:
+
+1. Set backup properties in uba-site.properties:
+   ```bash
+   # Edit /etc/caspida/local/conf/uba-site.properties
+   backup.filesystem.enabled=true
+   backup.filesystem.directory=/backup
+   backup.filesystem.full.interval=1 week
+   ```
+
+2. Synchronize changes in distributed deployment:
+   ```bash
+   /opt/caspida/bin/Caspida sync-cluster /etc/caspida/local/conf
+   ```
+
+3. Create and configure backup directory:
+   ```bash
+   sudo mkdir -p /backup
+   sudo chown caspida:caspida /backup
+   sudo chmod 755 /backup
+   ```
+
+4. Verify backup configuration:
+   ```bash
+   grep backup.filesystem /etc/caspida/local/conf/uba-site.properties
+   ```
+
+### Manual Full Backup Procedure
+For major upgrades or migrations:
+
+1. Stop all services:
+   ```bash
+   /opt/caspida/bin/Caspida stop-all
+   ```
+
+2. Run backup script:
+   ```bash
+   /opt/caspida/bin/utils/backup.sh -d /backup -a
+   ```
+   Options:
+   - `-d /backup`: Backup directory path
+   - `-a`: Create archive
+   - `-c`: Include container data
+   - `-s`: Skip regular backups for selective backup
+
+3. Start all services after backup:
+   ```bash
+   /opt/caspida/bin/Caspida start-all
+   ```
+
+4. Verify backup was successful:
+   ```bash
+   ls -la /backup/
+   ```
+
+### Restore Procedure
+In case of system failure or migration:
+
+1. Stop all services:
+   ```bash
+   /opt/caspida/bin/Caspida stop-all
+   ```
+
+2. Run restore script:
+   ```bash
+   /opt/caspida/bin/utils/restore.sh -d /backup/<backup-timestamp> -a
+   ```
+   Options:
+   - `-d /backup/<backup-timestamp>`: Path to backup directory
+   - `-a`: Restore from archive
+   - `-c`: Include container data
+   - `-s`: Selective restore
+
+3. Start all services after restore:
+   ```bash
+   /opt/caspida/bin/Caspida start-all
+   ```
+
+## 9. Configure Warm Standby for High Availability
+
+For critical deployments requiring high availability:
+
+1. Configure warm standby properties:
+   ```bash
+   # On primary system, edit /etc/caspida/local/conf/uba-site.properties
+   replication.enabled=true
+   replication.primary.host=<primary-hostname>
+   replication.standby.host=<standby-hostname>
+   ```
+
+2. Setup replication on primary node:
+   ```bash
+   /opt/caspida/bin/replication/setup standby -m primary -r
+   ```
+
+3. Setup replication on standby node:
+   ```bash
+   /opt/caspida/bin/replication/setup standby -m standby -r
+   ```
+
+4. Initiate full synchronization:
+   ```bash
+   curl -X POST -k -H "Authorization: Bearer $(grep '^\s*jobmanager.restServer.auth.user.token=' /opt/caspida/conf/uba-default.properties | cut -d'=' -f2)" https://localhost:9002/jobs/trigger?name=ReplicationCoordinator
+   ```
+
+5. Verify synchronization status:
+   ```bash
+   psql -d caspidadb -c 'select * from replication'
+   ```
+
+## 10. Monitor Splunk UBA
+
+### Health Monitoring
 Regular health monitoring is critical for maintaining optimal performance:
 
 1. **Run health check script:**
@@ -503,177 +741,130 @@ For troubleshooting and support:
    /var/log/caspida/
    ```
 
-## 9. Security Hardening and Best Practices
+## 11. Customize Splunk UBA
 
-### Secure Default Account
-After installation, immediately secure the default admin account:
+### Configure Internal IP Ranges
+For proper classification of internal vs external traffic:
 
-1. **Change default admin password:**
-   ```
-   # Navigate to Manage > UBA Accounts
-   # Edit admin user
-   # Set strong password
-   ```
-
-2. **Restrict sudo access (optional):**
+1. Edit the EntityValidations.json file:
    ```bash
-   # Edit /etc/sudoers to limit caspida user permissions
-   # Remove NOPASSWD:ALL if desired
-   # Add specific command permissions only
+   cd /etc/caspida/local/conf/etl/configuration
+   vi EntityValidations.json
    ```
 
-### Third-Party Security Agents
-Install security agents only AFTER UBA installation:
+2. Add your internal IP ranges in CIDR notation:
+   ```json
+   "internalIPRange": ["199.79.0.0/16", "220.200.0.0/16"]
+   ```
 
-1. **Exclude UBA directories from scanning:**
+3. Optionally add office location mapping:
+   ```json
+   "internalGeoAttributions": [
+     {"cidr": "10.0.0.0/8", "location": {"city": "San Jose", "countryCode": "US", "latitude": 37.3382, "longitude": -121.8863}},
+     {"cidr": "172.16.0.0/16", "location": {"city": "New York", "countryCode": "US", "latitude": 40.788614, "longitude": -73.9696091}}
+   ]
+   ```
+
+4. Validate the configuration:
    ```bash
-   # Add these paths to security agent exclusions:
-   /var/vcap/store/docker/overlay2/
-   /opt/caspida/
-   /var/vcap/
+   /opt/caspida/bin/status/check_entity_validations.sh -v
    ```
 
-2. **Monitor resource impact:**
+5. Synchronize changes across nodes:
    ```bash
-   # Check if security agents cause high CPU usage
-   top
-   htop
+   /opt/caspida/bin/Caspida sync-cluster /etc/caspida/local/conf/etl/configuration
    ```
 
-### Regular Security Updates
-Apply OS security patches regularly on RHEL 8.10:
+### Geo-Location Settings
+For accurate location-based analytics:
 
-```bash
-# Stop UBA services
-/opt/caspida/bin/Caspida stop-all
+1. Navigate to Manage > Settings > Geo Location
 
-# Check for security updates
-sudo yum updateinfo list security all
+2. Configure default office location with:
+   - Latitude and longitude coordinates
+   - Location name
+   - Enable "Show Geo Maps" option
 
-# Apply security updates
-sudo yum update --security -y
-sudo yum --security update-minimal
+### Email Alerts Configuration
+For system alerts and notifications:
 
-# Reboot if required
-sudo reboot
+1. First set up email output connector:
+   ```
+   # Navigate to Manage > Output Connectors > Add Output Connector > Email
+   ```
 
-# Start UBA services
-/opt/caspida/bin/Caspida start-all
-```
+2. Configure system alerts:
+   - Navigate to Manage > Settings > Alerts
+   - Add administrator email addresses (one per line)
+   - Enable "Alert when processing stops" option
+   - Set minimum EPS threshold
+   - Set alert interval in seconds
 
-### Certificate Security
-Maintain certificate security:
+### Customize Anomaly and Threat Parameters
 
-1. **Monitor certificate expiration:**
+1. Set entity score lookback window:
    ```bash
-   # Check certificate validity
-   openssl x509 -in /var/vcap/store/caspida/certs/my-server.crt.pem -text -noout | grep -E 'Not Before|Not After'
+   # Edit /etc/caspida/local/conf/uba-site.properties
+   entity.score.lookbackWindowMonths=2
    ```
 
-2. **Set up certificate renewal alerts:**
-   - Monitor certificates that expire within 30 days
-   - Configure automated renewal if possible
-   - Plan certificate replacement procedures
-
-3. **Secure certificate storage:**
+2. Configure anomaly retention period:
    ```bash
-   # Ensure proper permissions
-   chmod 644 /var/vcap/store/caspida/certs/*/*
-   chown root:root /var/vcap/store/caspida/certs/*/*
+   # Edit /etc/caspida/local/conf/uba-site.properties
+   persistence.anomalies.trashed.maintain.days=90
    ```
 
-## 16. Deployment Summary and Next Steps
-
-### Deployment Validation
-Use the comprehensive **Splunk_UBA_Deployment_Checklist.md** document to validate all deployment tasks. This checklist covers:
-
-- Pre-installation validation (hardware, OS, network, storage)
-- Installation process verification  
-- Configuration validation
-- Data source setup confirmation
-- Security and authentication validation
-- Performance and monitoring setup
-- Final production readiness sign-off
-
-### Post-Deployment Activities
-
-1. **Monitor Initial Operation:**
-   - Review system health for first 24-48 hours
-   - Monitor data ingestion rates and processing
-   - Verify anomaly and threat detection begins
-
-2. **Optimization and Tuning:**
-   - Adjust performance parameters based on actual workload
-   - Fine-tune anomaly detection thresholds
-   - Optimize data retention policies
-
-3. **User Training:**
-   - Train security analysts on UBA interface
-   - Provide documentation for common tasks
-   - Establish escalation procedures
-
-4. **Ongoing Maintenance:**
-   - Establish regular backup verification
-   - Schedule periodic security updates
-   - Plan for certificate renewals
-   - Monitor system capacity and plan for scaling
-
-### Key Resources
-
-- **Splunk UBA Documentation:** Official Splunk UBA documentation on docs.splunk.com
-- **Splunk Community:** answers.splunk.com for community support
-- **Splunk Support:** support.splunk.com for enterprise support
-- **Splunk Professional Services:** For advanced implementation assistance
-- **Troubleshooting Guide:** Splunk_UBA_Troubleshooting_Guide.md for detailed issue resolution
-
-### Emergency Procedures
-
-Keep the following information readily available:
-
-1. **Admin Password Reset Procedure:**
+3. Set anomaly purge batch size:
    ```bash
-   /opt/caspida/bin/admin_password_reset.sh
+   # Edit /etc/caspida/local/conf/uba-site.properties
+   persistance.anomalies.trashed.del.limit=300000
    ```
 
-2. **Emergency Service Restart:**
+4. Configure threat rule engine timeout:
    ```bash
-   /opt/caspida/bin/Caspida stop-all
-   /opt/caspida/bin/Caspida start-all
+   # Edit /etc/caspida/local/conf/uba-site.properties
+   rule.engine.process.timeout.min=60
    ```
 
-3. **Health Check Command:**
+5. Synchronize and restart required services:
    ```bash
-   /opt/caspida/bin/utils/uba_health_check.sh
+   /opt/caspida/bin/Caspida sync-cluster /etc/caspida/local/conf
+   /opt/caspida/bin/Caspida stop-containers
+   /opt/caspida/bin/Caspida start-containers
    ```
 
-4. **Log Locations:**
-   - UI: `/var/vcap/sys/log/caspida-ui/`
-   - Job Manager: `/var/vcap/sys/log/caspida-jobmanager/`
-   - Data Sources: `/var/vcap/sys/log/caspida-datasource/`
-   - System: `/var/log/caspida/`
+### Masking PII Information
+For compliance with privacy regulations:
 
-### Support Information
+1. Navigate to Manage > Settings > PII
 
-**Version:** Splunk UBA 5.4.2 on RHEL 8.10  
-**Document Version:** 1.0  
-**Last Updated:** June 2025
+2. Configure masking for sensitive fields:
+   - User information
+   - Threat information
+   - Device information
 
-For technical support, gather the following information:
-- UBA version and build number
-- RHEL 8.10 version and kernel information
-- Deployment topology (single/distributed)
-- Description of issue with relevant log entries
-- Output of health check script
+3. Set masking level:
+   - Full masking: Complete obfuscation
+   - Partial masking: Show limited identifiable information
 
----
+### Disable UI Timeout (Optional)
+For installations that need continuous monitoring:
 
-**Deployment Complete!** Your Splunk UBA 5.4.2 environment is now ready for production use.
+1. Set timeout property (in milliseconds):
+   ```bash
+   # Edit /etc/caspida/local/conf/uba-site.properties
+   # To disable timeout:
+   ui.idleTimeout=0
+   # For 1-hour timeout:
+   ui.idleTimeout=3600000
+   ```
 
-> **Note:** For comprehensive deployment validation, refer to the separate **Splunk_UBA_Deployment_Checklist.md** document.
-> 
-> **Troubleshooting:** For detailed troubleshooting procedures, refer to **Splunk_UBA_Troubleshooting_Guide.md**.
+2. Restart UI service:
+   ```bash
+   sudo service caspida-ui restart
+   ```
 
-## 11. Data Source Configuration
+## 12. Data Source Configuration
 
 ### Required Data Sources
 For effective threat detection, the following data sources should be configured in priority order:
@@ -822,242 +1013,144 @@ For secure data source connections:
    # Ensure user-device associations are properly established
    ```
 
-## 12. Backup & Restore Configuration
+## 13. Send Data from Splunk UBA
 
-### Configure Automated Incremental Backups
-For disaster recovery and high availability:
+### Send UBA Data to Splunk Enterprise Security
+For integration with Splunk ES:
 
-1. Set backup properties in uba-site.properties:
+1. **Configure ES integration:**
    ```bash
    # Edit /etc/caspida/local/conf/uba-site.properties
-   backup.filesystem.enabled=true
-   backup.filesystem.directory=/backup
-   backup.filesystem.full.interval=1 week
+   uba.splunkes.retry.delay.minutes=5
+   uba.sys.audit.push.splunk.enabled=true
+   identity.resolution.export.enabled=true
    ```
 
-2. Synchronize changes in distributed deployment:
-   ```bash
-   /opt/caspida/bin/Caspida sync-cluster /etc/caspida/local/conf
-   ```
+2. **Configure threat synchronization:**
+   - UBA automatically sends threats to Splunk ES
+   - Threats appear as notables in ES
+   - Configure sync frequency as needed
 
-3. Create and configure backup directory:
-   ```bash
-   sudo mkdir -p /backup
-   sudo chown caspida:caspida /backup
-   sudo chmod 755 /backup
-   ```
+3. **Send user and device associations:**
+   - Enable identity resolution export
+   - Data appears in Session Center dashboard in ES
 
-4. Verify backup configuration:
-   ```bash
-   grep backup.filesystem /etc/caspida/local/conf/uba-site.properties
-   ```
+### Send Threats via Email
+Configure email notifications for threats:
 
-### Manual Full Backup Procedure
-For major upgrades or migrations:
-
-1. Stop all services:
-   ```bash
-   /opt/caspida/bin/Caspida stop-all
-   ```
-
-2. Run backup script:
-   ```bash
-   /opt/caspida/bin/utils/backup.sh -d /backup -a
-   ```
-   Options:
-   - `-d /backup`: Backup directory path
-   - `-a`: Create archive
-   - `-c`: Include container data
-   - `-s`: Skip regular backups for selective backup
-
-3. Start all services after backup:
-   ```bash
-   /opt/caspida/bin/Caspida start-all
-   ```
-
-4. Verify backup was successful:
-   ```bash
-   ls -la /backup/
-   ```
-
-### Restore Procedure
-In case of system failure or migration:
-
-1. Stop all services:
-   ```bash
-   /opt/caspida/bin/Caspida stop-all
-   ```
-
-2. Run restore script:
-   ```bash
-   /opt/caspida/bin/utils/restore.sh -d /backup/<backup-timestamp> -a
-   ```
-   Options:
-   - `-d /backup/<backup-timestamp>`: Path to backup directory
-   - `-a`: Restore from archive
-   - `-c`: Include container data
-   - `-s`: Selective restore
-
-3. Start all services after restore:
-   ```bash
-   /opt/caspida/bin/Caspida start-all
-   ```
-
-### Configure Warm Standby for High Availability
-For critical deployments requiring high availability:
-
-1. Configure warm standby properties:
-   ```bash
-   # On primary system, edit /etc/caspida/local/conf/uba-site.properties
-   replication.enabled=true
-   replication.primary.host=<primary-hostname>
-   replication.standby.host=<standby-hostname>
-   ```
-
-2. Setup replication on primary node:
-   ```bash
-   /opt/caspida/bin/replication/setup standby -m primary -r
-   ```
-
-3. Setup replication on standby node:
-   ```bash
-   /opt/caspida/bin/replication/setup standby -m standby -r
-   ```
-
-4. Initiate full synchronization:
-   ```bash
-   curl -X POST -k -H "Authorization: Bearer $(grep '^\s*jobmanager.restServer.auth.user.token=' /opt/caspida/conf/uba-default.properties | cut -d'=' -f2)" https://localhost:9002/jobs/trigger?name=ReplicationCoordinator
-   ```
-
-5. Verify synchronization status:
-   ```bash
-   psql -d caspidadb -c 'select * from replication'
-   ```
-
-## 13. Custom Configurations & Optimizations
-
-### Configure Internal IP Ranges
-For proper classification of internal vs external traffic:
-
-1. Edit the EntityValidations.json file:
-   ```bash
-   cd /etc/caspida/local/conf/etl/configuration
-   vi EntityValidations.json
-   ```
-
-2. Add your internal IP ranges in CIDR notation:
-   ```json
-   "internalIPRange": ["199.79.0.0/16", "220.200.0.0/16"]
-   ```
-
-3. Optionally add office location mapping:
-   ```json
-   "internalGeoAttributions": [
-     {"cidr": "10.0.0.0/8", "location": {"city": "San Jose", "countryCode": "US", "latitude": 37.3382, "longitude": -121.8863}},
-     {"cidr": "172.16.0.0/16", "location": {"city": "New York", "countryCode": "US", "latitude": 40.788614, "longitude": -73.9696091}}
-   ]
-   ```
-
-4. Validate the configuration:
-   ```bash
-   /opt/caspida/bin/status/check_entity_validations.sh -v
-   ```
-
-5. Synchronize changes across nodes:
-   ```bash
-   /opt/caspida/bin/Caspida sync-cluster /etc/caspida/local/conf/etl/configuration
-   ```
-
-### Geo-Location Settings
-For accurate location-based analytics:
-
-1. Navigate to Manage > Settings > Geo Location
-
-2. Configure default office location with:
-   - Latitude and longitude coordinates
-   - Location name
-   - Enable "Show Geo Maps" option
-
-### Email Alerts Configuration
-For system alerts and notifications:
-
-1. First set up email output connector:
+1. **Set up email output connector:**
    ```
    # Navigate to Manage > Output Connectors > Add Output Connector > Email
    ```
 
-2. Configure system alerts:
-   - Navigate to Manage > Settings > Alerts
-   - Add administrator email addresses (one per line)
-   - Enable "Alert when processing stops" option
-   - Set minimum EPS threshold
-   - Set alert interval in seconds
+2. **Configure SMTP settings:**
+   - SMTP server hostname
+   - Port (typically 25, 587, or 465)
+   - Authentication credentials
+   - SSL/TLS settings
 
-### Customize Anomaly and Threat Parameters
+3. **Create threat notification rules:**
+   - Configure which threats trigger emails
+   - Set recipient lists
+   - Customize email templates
 
-1. Set entity score lookback window:
-   ```bash
-   # Edit /etc/caspida/local/conf/uba-site.properties
-   entity.score.lookbackWindowMonths=2
+### Send Threats to ServiceNow
+For ITSM integration:
+
+1. **Configure ServiceNow connector:**
+   ```
+   # Navigate to Manage > Output Connectors > Add Output Connector > ServiceNow
    ```
 
-2. Configure anomaly retention period:
-   ```bash
-   # Edit /etc/caspida/local/conf/uba-site.properties
-   persistence.anomalies.trashed.maintain.days=90
+2. **Provide ServiceNow details:**
+   - ServiceNow instance URL
+   - Username and password
+   - Table name (typically incident)
+
+3. **Configure threat mapping:**
+   - Map UBA threat fields to ServiceNow fields
+   - Set priority and category mappings
+
+## 14. Security Hardening and Best Practices
+
+### Secure Default Account
+After installation, immediately secure the default admin account:
+
+1. **Change default admin password:**
+   ```
+   # Navigate to Manage > UBA Accounts
+   # Edit admin user
+   # Set strong password
    ```
 
-3. Set anomaly purge batch size:
+2. **Restrict sudo access (optional):**
    ```bash
-   # Edit /etc/caspida/local/conf/uba-site.properties
-   persistance.anomalies.trashed.del.limit=300000
+   # Edit /etc/sudoers to limit caspida user permissions
+   # Remove NOPASSWD:ALL if desired
+   # Add specific command permissions only
    ```
 
-4. Configure threat rule engine timeout:
+### Third-Party Security Agents
+Install security agents only AFTER UBA installation:
+
+1. **Exclude UBA directories from scanning:**
    ```bash
-   # Edit /etc/caspida/local/conf/uba-site.properties
-   rule.engine.process.timeout.min=60
+   # Add these paths to security agent exclusions:
+   /var/vcap/store/docker/overlay2/
+   /opt/caspida/
+   /var/vcap/
    ```
 
-5. Synchronize and restart required services:
+2. **Monitor resource impact:**
    ```bash
-   /opt/caspida/bin/Caspida sync-cluster /etc/caspida/local/conf
-   /opt/caspida/bin/Caspida stop-containers
-   /opt/caspida/bin/Caspida start-containers
+   # Check if security agents cause high CPU usage
+   top
+   htop
    ```
 
-### Masking PII Information
-For compliance with privacy regulations:
+### Regular Security Updates
+Apply OS security patches regularly on RHEL 8.10:
 
-1. Navigate to Manage > Settings > PII
+```bash
+# Stop UBA services
+/opt/caspida/bin/Caspida stop-all
 
-2. Configure masking for sensitive fields:
-   - User information
-   - Threat information
-   - Device information
+# Check for security updates
+sudo yum updateinfo list security all
 
-3. Set masking level:
-   - Full masking: Complete obfuscation
-   - Partial masking: Show limited identifiable information
+# Apply security updates
+sudo yum update --security -y
+sudo yum --security update-minimal
 
-### Disable UI Timeout (Optional)
-For installations that need continuous monitoring:
+# Reboot if required
+sudo reboot
 
-1. Set timeout property (in milliseconds):
+# Start UBA services
+/opt/caspida/bin/Caspida start-all
+```
+
+### Certificate Security
+Maintain certificate security:
+
+1. **Monitor certificate expiration:**
    ```bash
-   # Edit /etc/caspida/local/conf/uba-site.properties
-   # To disable timeout:
-   ui.idleTimeout=0
-   # For 1-hour timeout:
-   ui.idleTimeout=3600000
+   # Check certificate validity
+   openssl x509 -in /var/vcap/store/caspida/certs/my-server.crt.pem -text -noout | grep -E 'Not Before|Not After'
    ```
 
-2. Restart UI service:
+2. **Set up certificate renewal alerts:**
+   - Monitor certificates that expire within 30 days
+   - Configure automated renewal if possible
+   - Plan certificate replacement procedures
+
+3. **Secure certificate storage:**
    ```bash
-   sudo service caspida-ui restart
+   # Ensure proper permissions
+   chmod 644 /var/vcap/store/caspida/certs/*/*
+   chown root:root /var/vcap/store/caspida/certs/*/*
    ```
 
-## 14. Troubleshooting
+## 15. Troubleshooting
 
 For comprehensive troubleshooting procedures covering installation issues, service problems, data source issues, SSL certificate problems, performance issues, and emergency recovery procedures, refer to the separate **Splunk_UBA_Troubleshooting_Guide.md** document.
 
@@ -1083,7 +1176,7 @@ For comprehensive troubleshooting procedures covering installation issues, servi
 - Data Sources: `/var/vcap/sys/log/caspida-datasource/caspida-datasource.stderr.log`
 - System: `/var/log/caspida/caspida.out`
 
-## 15. Advanced Administration
+## 16. Advanced Administration
 
 ### Managing UBA Configuration Properties
 Configure UBA by editing `/etc/caspida/local/conf/uba-site.properties`:
@@ -1210,3 +1303,94 @@ If you need to change the IP address or hostname:
    /opt/caspida/bin/Caspida sync-cluster /etc/caspida/local/conf
    /opt/caspida/bin/Caspida restart
    ```
+
+## 17. Deployment Summary and Next Steps
+
+### Deployment Validation
+Use the comprehensive **Splunk_UBA_Deployment_Checklist.md** document to validate all deployment tasks. This checklist covers:
+
+- Pre-installation validation (hardware, OS, network, storage)
+- Installation process verification  
+- Configuration validation
+- Data source setup confirmation
+- Security and authentication validation
+- Performance and monitoring setup
+- Final production readiness sign-off
+
+### Post-Deployment Activities
+
+1. **Monitor Initial Operation:**
+   - Review system health for first 24-48 hours
+   - Monitor data ingestion rates and processing
+   - Verify anomaly and threat detection begins
+
+2. **Optimization and Tuning:**
+   - Adjust performance parameters based on actual workload
+   - Fine-tune anomaly detection thresholds
+   - Optimize data retention policies
+
+3. **User Training:**
+   - Train security analysts on UBA interface
+   - Provide documentation for common tasks
+   - Establish escalation procedures
+
+4. **Ongoing Maintenance:**
+   - Establish regular backup verification
+   - Schedule periodic security updates
+   - Plan for certificate renewals
+   - Monitor system capacity and plan for scaling
+
+### Key Resources
+
+- **Splunk UBA Documentation:** Official Splunk UBA documentation on docs.splunk.com
+- **Splunk Community:** answers.splunk.com for community support
+- **Splunk Support:** support.splunk.com for enterprise support
+- **Splunk Professional Services:** For advanced implementation assistance
+- **Troubleshooting Guide:** Splunk_UBA_Troubleshooting_Guide.md for detailed issue resolution
+
+### Emergency Procedures
+
+Keep the following information readily available:
+
+1. **Admin Password Reset Procedure:**
+   ```bash
+   /opt/caspida/bin/admin_password_reset.sh
+   ```
+
+2. **Emergency Service Restart:**
+   ```bash
+   /opt/caspida/bin/Caspida stop-all
+   /opt/caspida/bin/Caspida start-all
+   ```
+
+3. **Health Check Command:**
+   ```bash
+   /opt/caspida/bin/utils/uba_health_check.sh
+   ```
+
+4. **Log Locations:**
+   - UI: `/var/vcap/sys/log/caspida-ui/`
+   - Job Manager: `/var/vcap/sys/log/caspida-jobmanager/`
+   - Data Sources: `/var/vcap/sys/log/caspida-datasource/`
+   - System: `/var/log/caspida/`
+
+### Support Information
+
+**Version:** Splunk UBA 5.4.2 on RHEL 8.10  
+**Document Version:** 1.0  
+**Last Updated:** June 2025
+
+For technical support, gather the following information:
+- UBA version and build number
+- RHEL 8.10 version and kernel information
+- Deployment topology (single/distributed)
+- Description of issue with relevant log entries
+- Output of health check script
+
+---
+
+**Deployment Complete!** Your Splunk UBA 5.4.2 environment is now ready for production use.
+
+> **Note:** For comprehensive deployment validation, refer to the separate **Splunk_UBA_Deployment_Checklist.md** document.
+> 
+> **Troubleshooting:** For detailed troubleshooting procedures, refer to **Splunk_UBA_Troubleshooting_Guide.md**.
