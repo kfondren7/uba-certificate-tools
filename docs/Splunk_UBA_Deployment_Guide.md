@@ -1304,7 +1304,538 @@ If you need to change the IP address or hostname:
    /opt/caspida/bin/Caspida restart
    ```
 
-## 17. Deployment Summary and Next Steps
+## 17. Service Management Migration and Non-Privileged Operations
+
+### Switching from Script-Managed to systemctl-Managed Services
+
+UBA can be managed either through traditional Caspida scripts (`/opt/caspida/bin/Caspida`) or modern systemd services. This section covers migrating to systemctl management for better system integration.
+
+#### Current Service Management Assessment
+
+1. **Check current service management method:**
+   ```bash
+   # Check if systemd services exist
+   systemctl list-units --type=service | grep caspida
+   
+   # Check running UBA processes
+   ps aux | grep -E "(caspida|java.*uba)" | grep -v grep
+   
+   # Test script-based management
+   /opt/caspida/bin/Caspida status
+   ```
+
+2. **Determine migration readiness:**
+   ```bash
+   # Verify UBA installation completeness
+   ls -la /opt/caspida/bin/
+   ls -la /etc/caspida/
+   
+   # Check systemd capability
+   systemctl --version
+   systemctl status | head -5
+   ```
+
+#### Creating systemd Service Units
+
+1. **Create systemd service files for core UBA services:**
+   ```bash
+   # Create UI service unit
+   sudo tee /etc/systemd/system/caspida-ui.service > /dev/null << 'EOF'
+   [Unit]
+   Description=Splunk UBA UI Service
+   After=network.target
+   Wants=network.target
+   
+   [Service]
+   Type=forking
+   User=caspida
+   Group=caspida
+   Environment="JAVA_HOME=/opt/caspida/third-party/java/current"
+   Environment="CASPIDA_HOME=/opt/caspida"
+   ExecStart=/opt/caspida/bin/containers/caspida-ui start
+   ExecStop=/opt/caspida/bin/containers/caspida-ui stop
+   ExecReload=/opt/caspida/bin/containers/caspida-ui restart
+   PIDFile=/var/vcap/sys/run/caspida-ui/caspida-ui.pid
+   TimeoutStartSec=300
+   TimeoutStopSec=300
+   Restart=no
+   
+   [Install]
+   WantedBy=multi-user.target
+   EOF
+   
+   # Create Job Manager service unit
+   sudo tee /etc/systemd/system/caspida-jobmanager.service > /dev/null << 'EOF'
+   [Unit]
+   Description=Splunk UBA Job Manager Service
+   After=network.target postgresql.service
+   Wants=network.target
+   Requires=postgresql.service
+   
+   [Service]
+   Type=forking
+   User=caspida
+   Group=caspida
+   Environment="JAVA_HOME=/opt/caspida/third-party/java/current"
+   Environment="CASPIDA_HOME=/opt/caspida"
+   ExecStart=/opt/caspida/bin/containers/caspida-jobmanager start
+   ExecStop=/opt/caspida/bin/containers/caspida-jobmanager stop
+   ExecReload=/opt/caspida/bin/containers/caspida-jobmanager restart
+   PIDFile=/var/vcap/sys/run/caspida-jobmanager/caspida-jobmanager.pid
+   TimeoutStartSec=300
+   TimeoutStopSec=300
+   Restart=no
+   
+   [Install]
+   WantedBy=multi-user.target
+   EOF
+   
+   # Create Resource Monitor service unit
+   sudo tee /etc/systemd/system/caspida-resourcesmonitor.service > /dev/null << 'EOF'
+   [Unit]
+   Description=Splunk UBA Resource Monitor Service
+   After=network.target
+   Wants=network.target
+   
+   [Service]
+   Type=forking
+   User=caspida
+   Group=caspida
+   Environment="JAVA_HOME=/opt/caspida/third-party/java/current"
+   Environment="CASPIDA_HOME=/opt/caspida"
+   ExecStart=/opt/caspida/bin/containers/caspida-resourcesmonitor start
+   ExecStop=/opt/caspida/bin/containers/caspida-resourcesmonitor stop
+   ExecReload=/opt/caspida/bin/containers/caspida-resourcesmonitor restart
+   PIDFile=/var/vcap/sys/run/caspida-resourcesmonitor/caspida-resourcesmonitor.pid
+   TimeoutStartSec=300
+   TimeoutStopSec=300
+   Restart=no
+   
+   [Install]
+   WantedBy=multi-user.target
+   EOF
+   ```
+
+2. **Reload systemd and enable services:**
+   ```bash
+   # Reload systemd configuration
+   sudo systemctl daemon-reload
+   
+   # Verify service files are valid
+   sudo systemctl status caspida-ui.service
+   sudo systemctl status caspida-jobmanager.service
+   sudo systemctl status caspida-resourcesmonitor.service
+   
+   # Enable services for automatic startup
+   sudo systemctl enable caspida-ui.service
+   sudo systemctl enable caspida-jobmanager.service
+   sudo systemctl enable caspida-resourcesmonitor.service
+   ```
+
+#### Migration Procedure
+
+1. **Stop services using existing method:**
+   ```bash
+   # Stop all UBA services cleanly
+   /opt/caspida/bin/Caspida stop-all
+   
+   # Verify all services are stopped
+   ps aux | grep -E "(caspida|java.*uba)" | grep -v grep
+   sleep 30
+   ```
+
+2. **Test systemd service startup:**
+   ```bash
+   # Start services individually to test
+   sudo systemctl start caspida-jobmanager.service
+   sleep 60
+   sudo systemctl status caspida-jobmanager.service
+   
+   sudo systemctl start caspida-ui.service
+   sleep 30
+   sudo systemctl status caspida-ui.service
+   
+   sudo systemctl start caspida-resourcesmonitor.service
+   sleep 30
+   sudo systemctl status caspida-resourcesmonitor.service
+   ```
+
+3. **Verify functionality:**
+   ```bash
+   # Check UBA health
+   /opt/caspida/bin/utils/uba_health_check.sh
+   
+   # Test UI accessibility
+   curl -k -I https://localhost/
+   
+   # Test Job Manager API
+   curl -k -I https://localhost:9002/health
+   ```
+
+4. **Create service management wrapper script:**
+   ```bash
+   # Create hybrid management script
+   sudo tee /usr/local/bin/caspida-service-manager > /dev/null << 'EOF'
+   #!/bin/bash
+   # Caspida Service Management Wrapper
+   # Supports both systemd and traditional script management
+   
+   SERVICES=("caspida-jobmanager" "caspida-ui" "caspida-resourcesmonitor")
+   
+   function check_systemd() {
+       systemctl list-units --type=service | grep -q caspida
+   }
+   
+   function start_all() {
+       if check_systemd; then
+           echo "Starting UBA services via systemd..."
+           for service in "${SERVICES[@]}"; do
+               sudo systemctl start "$service"
+               echo "Started $service"
+           done
+       else
+           echo "Starting UBA services via scripts..."
+           /opt/caspida/bin/Caspida start-all
+       fi
+   }
+   
+   function stop_all() {
+       if check_systemd; then
+           echo "Stopping UBA services via systemd..."
+           for service in "${SERVICES[@]}"; do
+               sudo systemctl stop "$service"
+               echo "Stopped $service"
+           done
+       else
+           echo "Stopping UBA services via scripts..."
+           /opt/caspida/bin/Caspida stop-all
+       fi
+   }
+   
+   function status_all() {
+       if check_systemd; then
+           echo "UBA service status via systemd:"
+           for service in "${SERVICES[@]}"; do
+               systemctl is-active "$service" || echo "$service: inactive"
+           done
+       else
+           echo "UBA service status via scripts:"
+           /opt/caspida/bin/Caspida status
+       fi
+   }
+   
+   case "$1" in
+       start)
+           start_all
+           ;;
+       stop)
+           stop_all
+           ;;
+       status)
+           status_all
+           ;;
+       restart)
+           stop_all
+           sleep 30
+           start_all
+           ;;
+       *)
+           echo "Usage: $0 {start|stop|restart|status}"
+           exit 1
+           ;;
+   esac
+   EOF
+   
+   # Make executable
+   sudo chmod +x /usr/local/bin/caspida-service-manager
+   ```
+
+### Configuring Non-Privileged UBA Instance
+
+For enhanced security, UBA can be configured to run with minimal privileges and restricted sudo access.
+
+#### Security Assessment and Planning
+
+1. **Current privilege assessment:**
+   ```bash
+   # Check current caspida user privileges
+   sudo -l -U caspida
+   
+   # Review current sudo configuration
+   sudo grep -r caspida /etc/sudoers*
+   
+   # Check file ownership
+   find /opt/caspida -user root -ls | head -10
+   find /var/vcap -user root -ls | head -10
+   ```
+
+2. **Identify required privileges:**
+   ```bash
+   # Services that need specific access
+   echo "Required UBA service privileges:"
+   echo "- Network port binding (>1024 for non-privileged)"
+   echo "- File system access (/opt/caspida, /var/vcap, /etc/caspida)"
+   echo "- Log file management"
+   echo "- Process management (start/stop own services)"
+   echo "- Certificate management (if SSL enabled)"
+   ```
+
+#### Implementing Non-Privileged Configuration
+
+1. **Create restricted sudo configuration:**
+   ```bash
+   # Create specific sudoers file for caspida
+   sudo tee /etc/sudoers.d/10-caspida-restricted > /dev/null << 'EOF'
+   # Restricted sudo access for Caspida user
+   # Allow only specific service management commands
+   
+   Defaults:caspida !requiretty, env_keep += "JAVA_HOME CASPIDA_HOME"
+   
+   # Service management - only for caspida services
+   caspida ALL=(ALL) NOPASSWD: /bin/systemctl start caspida-*
+   caspida ALL=(ALL) NOPASSWD: /bin/systemctl stop caspida-*
+   caspida ALL=(ALL) NOPASSWD: /bin/systemctl restart caspida-*
+   caspida ALL=(ALL) NOPASSWD: /bin/systemctl status caspida-*
+   caspida ALL=(ALL) NOPASSWD: /bin/systemctl reload caspida-*
+   
+   # Platform services management (if co-located)
+   caspida ALL=(ALL) NOPASSWD: /bin/systemctl start postgresql
+   caspida ALL=(ALL) NOPASSWD: /bin/systemctl stop postgresql
+   caspida ALL=(ALL) NOPASSWD: /bin/systemctl restart postgresql
+   caspida ALL=(ALL) NOPASSWD: /bin/systemctl status postgresql
+   
+   caspida ALL=(ALL) NOPASSWD: /bin/systemctl start kafka-server
+   caspida ALL=(ALL) NOPASSWD: /bin/systemctl stop kafka-server
+   caspida ALL=(ALL) NOPASSWD: /bin/systemctl restart kafka-server
+   caspida ALL=(ALL) NOPASSWD: /bin/systemctl status kafka-server
+   
+   caspida ALL=(ALL) NOPASSWD: /bin/systemctl start zookeeper-server
+   caspida ALL=(ALL) NOPASSWD: /bin/systemctl stop zookeeper-server
+   caspida ALL=(ALL) NOPASSWD: /bin/systemctl restart zookeeper-server
+   caspida ALL=(ALL) NOPASSWD: /bin/systemctl status zookeeper-server
+   
+   # Log file access
+   caspida ALL=(ALL) NOPASSWD: /bin/tail /var/log/caspida/*
+   caspida ALL=(ALL) NOPASSWD: /bin/cat /var/log/caspida/*
+   caspida ALL=(ALL) NOPASSWD: /usr/bin/less /var/log/caspida/*
+   
+   # Certificate management (if needed)
+   caspida ALL=(ALL) NOPASSWD: /usr/bin/keytool -list -keystore *
+   caspida ALL=(ALL) NOPASSWD: /usr/bin/openssl verify *
+   caspida ALL=(ALL) NOPASSWD: /usr/bin/openssl x509 *
+   
+   # Disk space and system monitoring
+   caspida ALL=(ALL) NOPASSWD: /bin/df -h
+   caspida ALL=(ALL) NOPASSWD: /usr/bin/du -sh /opt/caspida*
+   caspida ALL=(ALL) NOPASSWD: /usr/bin/du -sh /var/vcap*
+   caspida ALL=(ALL) NOPASSWD: /bin/free -m
+   
+   # Network diagnostics
+   caspida ALL=(ALL) NOPASSWD: /bin/netstat -tulpn
+   caspida ALL=(ALL) NOPASSWD: /usr/sbin/ss -tulpn
+   caspida ALL=(ALL) NOPASSWD: /usr/sbin/lsof -i *
+   
+   # Process management for owned processes only
+   caspida ALL=(caspida) NOPASSWD: /bin/kill -TERM [0-9]*
+   caspida ALL=(caspida) NOPASSWD: /bin/kill -HUP [0-9]*
+   caspida ALL=(caspida) NOPASSWD: /usr/bin/pkill -f caspida*
+   
+   # Deny all other sudo access
+   caspida ALL=(ALL) !/bin/su*, !/bin/bash, !/bin/sh, !/usr/bin/vi*, !/usr/bin/nano, !/usr/bin/emacs
+   caspida ALL=(ALL) !/usr/bin/passwd*, !/usr/sbin/user*, !/usr/sbin/group*
+   caspida ALL=(ALL) !/bin/chmod [0-7][0-7][0-7]*, !/bin/chown*
+   caspida ALL=(ALL) !/usr/bin/rpm*, !/usr/bin/yum*, !/usr/bin/dnf*
+   EOF
+   
+   # Validate sudoers syntax
+   sudo visudo -c -f /etc/sudoers.d/10-caspida-restricted
+   ```
+
+2. **Configure non-privileged port binding:**
+   ```bash
+   # Configure UBA to use non-privileged ports
+   sudo -u caspida tee -a /etc/caspida/local/conf/uba-site.properties > /dev/null << 'EOF'
+   
+   # Non-privileged port configuration
+   # UI Server (use port 8080 instead of 80, 8443 instead of 443)
+   uiServer.port=8080
+   uiServer.ssl.port=8443
+   
+   # Job Manager (default 9002 is already >1024)
+   jobmanager.restServer.port=9002
+   
+   # Resource Monitor 
+   resourcesmonitor.port=9003
+   EOF
+   ```
+
+3. **Update systemd services for non-privileged operation:**
+   ```bash
+   # Update service files to include security restrictions
+   sudo tee /etc/systemd/system/caspida-ui.service > /dev/null << 'EOF'
+   [Unit]
+   Description=Splunk UBA UI Service (Non-Privileged)
+   After=network.target
+   Wants=network.target
+   
+   [Service]
+   Type=forking
+   User=caspida
+   Group=caspida
+   Environment="JAVA_HOME=/opt/caspida/third-party/java/current"
+   Environment="CASPIDA_HOME=/opt/caspida"
+   ExecStart=/opt/caspida/bin/containers/caspida-ui start
+   ExecStop=/opt/caspida/bin/containers/caspida-ui stop
+   ExecReload=/opt/caspida/bin/containers/caspida-ui restart
+   PIDFile=/var/vcap/sys/run/caspida-ui/caspida-ui.pid
+   TimeoutStartSec=300
+   TimeoutStopSec=300
+   Restart=on-failure
+   RestartSec=30
+   
+   # Security restrictions
+   NoNewPrivileges=true
+   PrivateTmp=true
+   ProtectSystem=strict
+   ProtectHome=true
+   ReadWritePaths=/opt/caspida /var/vcap /etc/caspida /tmp /var/tmp
+   
+   # Capabilities restrictions
+   CapabilityBoundingSet=
+   AmbientCapabilities=
+   
+   # System call restrictions
+   SystemCallFilter=@system-service
+   SystemCallErrorNumber=EPERM
+   
+   [Install]
+   WantedBy=multi-user.target
+   EOF
+   
+   # Reload systemd
+   sudo systemctl daemon-reload
+   ```
+
+4. **Set up file system permissions:**
+   ```bash
+   # Ensure proper ownership for caspida user
+   sudo chown -R caspida:caspida /opt/caspida
+   sudo chown -R caspida:caspida /var/vcap
+   sudo chown -R caspida:caspida /etc/caspida
+   
+   # Set proper permissions
+   sudo find /opt/caspida -type d -exec chmod 755 {} \;
+   sudo find /opt/caspida -type f -exec chmod 644 {} \;
+   sudo find /opt/caspida/bin -type f -exec chmod 755 {} \;
+   
+   # Secure sensitive directories
+   sudo chmod 700 /etc/caspida/conf/keystore
+   sudo chmod 600 /etc/caspida/conf/keystore/*
+   ```
+
+5. **Create monitoring and validation scripts:**
+   ```bash
+   # Create privilege validation script
+   sudo -u caspida tee /opt/caspida/bin/validate_privileges.sh > /dev/null << 'EOF'
+   #!/bin/bash
+   # Validate non-privileged UBA configuration
+   
+   echo "=== UBA Non-Privileged Configuration Validation ==="
+   
+   # Check user context
+   echo "Current user: $(whoami)"
+   echo "User ID: $(id)"
+   
+   # Check sudo permissions
+   echo -e "\n=== Sudo Permissions ==="
+   sudo -l 2>/dev/null | head -10
+   
+   # Check port bindings
+   echo -e "\n=== Port Bindings ==="
+   ss -tulpn | grep $(whoami) || echo "No ports bound to current user"
+   
+   # Check process ownership
+   echo -e "\n=== Running Processes ==="
+   ps aux | grep $(whoami) | grep -v grep | head -5
+   
+   # Check file permissions
+   echo -e "\n=== File Permissions ==="
+   ls -la /opt/caspida/ | head -5
+   ls -la /var/vcap/ | head -5
+   
+   # Test service management
+   echo -e "\n=== Service Management Test ==="
+   sudo systemctl status caspida-ui.service >/dev/null 2>&1 && echo "✓ Can check service status" || echo "✗ Cannot check service status"
+   
+   # Check certificate access
+   echo -e "\n=== Certificate Access ==="
+   ls -la /etc/caspida/conf/keystore/ 2>/dev/null | head -3 || echo "No keystore directory or access denied"
+   
+   echo -e "\n=== Validation Complete ==="
+   EOF
+   
+   chmod +x /opt/caspida/bin/validate_privileges.sh
+   ```
+
+#### Testing Non-Privileged Configuration
+
+1. **Validate configuration:**
+   ```bash
+   # Run validation script
+   sudo -u caspida /opt/caspida/bin/validate_privileges.sh
+   
+   # Test service management
+   sudo -u caspida sudo systemctl status caspida-ui.service
+   
+   # Test UBA functionality
+   sudo -u caspida /opt/caspida/bin/utils/uba_health_check.sh
+   ```
+
+2. **Performance and security verification:**
+   ```bash
+   # Check for privilege escalation attempts
+   sudo journalctl -u caspida-ui.service | grep -i "permission\|denied\|error" | tail -10
+   
+   # Verify port binding
+   ss -tulpn | grep caspida
+   
+   # Test UI accessibility on non-privileged ports
+   curl -k -I http://localhost:8080/
+   curl -k -I https://localhost:8443/
+   ```
+
+### Migration Best Practices
+
+1. **Pre-migration checklist:**
+   - [ ] Full system backup completed
+   - [ ] UBA services verified functional with script management
+   - [ ] systemd version compatibility confirmed
+   - [ ] Non-privileged port requirements assessed
+   - [ ] Security policy reviewed and approved
+
+2. **Migration validation:**
+   - [ ] systemd services start/stop correctly
+   - [ ] UBA health check passes
+   - [ ] Web UI accessible on configured ports
+   - [ ] Job Manager API responding
+   - [ ] Data ingestion continuing normally
+   - [ ] No privilege escalation errors in logs
+
+3. **Rollback procedure:**
+   ```bash
+   # If migration fails, rollback to script management
+   sudo systemctl stop caspida-*.service
+   sudo systemctl disable caspida-*.service
+   
+   # Remove systemd units
+   sudo rm /etc/systemd/system/caspida-*.service
+   sudo systemctl daemon-reload
+   
+   # Restore original configuration
+   sudo -u caspida /opt/caspida/bin/Caspida start-all
+   ```
+
+## 18. Deployment Summary and Next Steps
 
 ### Deployment Validation
 Use the comprehensive **Splunk_UBA_Deployment_Checklist.md** document to validate all deployment tasks. This checklist covers:

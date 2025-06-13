@@ -23,6 +23,8 @@ set -euo pipefail
 ###############################################################################
 
 detect_java_home() {
+    log_debug "Auto-detecting Java installation..."
+    
     # Use the exact same logic as CaspidaCommonEnv.sh
     local PLATFORM="Ubuntu"
     
@@ -62,20 +64,22 @@ detect_java_home() {
     
     # Verify that Java and keytool are executable
     if [ ! -x "$JAVA_HOME/bin/java" ]; then
-        echo "ERROR: Java executable not found at $JAVA_HOME/bin/java" >&2
+        log_error "Java executable not found at $JAVA_HOME/bin/java"
+        log_error "Consider using --java-home option to specify correct path"
         exit 1
     fi
     
     if [ ! -x "$JAVA_HOME/bin/keytool" ]; then
-        echo "ERROR: Keytool not found at $JAVA_HOME/bin/keytool" >&2
+        log_error "Keytool not found at $JAVA_HOME/bin/keytool"
+        log_error "Consider using --java-home option to specify correct path"
         exit 1
     fi
     
-    echo "Detected JAVA_HOME: $JAVA_HOME"
+    log "Auto-detected JAVA_HOME: $JAVA_HOME"
 }
 
 # Initialize Java environment
-# detect_java_home  # Temporarily disabled for testing
+# Note: Java environment will be initialized in check_prerequisites() based on CUSTOM_JAVA_HOME setting
 
 # Script configuration
 SCRIPT_NAME="$(basename "$0")"
@@ -88,15 +92,24 @@ UBA_CERTS_DIR="/var/vcap/store/caspida/certs"
 UBA_CUSTOM_CERTS_DIR="/var/vcap/store/caspida/certs/my_certs"
 UBA_SITE_PROPERTIES="/etc/caspida/local/conf/uba-site.properties"
 UBA_KEYSTORE_JM="/etc/caspida/conf/jobconf/keystore.jm"
+# Missing: UBA-specific keystore for internal cluster communication
+UBA_KEYSTORE="/etc/caspida/conf/keystore/uba-keystore"
+# Missing: Kafka keystores for data ingestion
+KAFKA_KEYSTORE_CONFIG="/opt/caspida/conf/kafka/kafka.properties"
+KAFKA_TRUSTSTORE="/opt/caspida/conf/kafka/auth/server.truststore.jks"
 JAVA_CACERTS="${JAVA_HOME}/lib/security/cacerts"
 
 # Default configuration
 CERT_SOURCE_DIR=""
+CUSTOM_JAVA_HOME=""  # Allow manual JAVA_HOME specification
 GENERATE_PKCS12=true
 PKCS12_PASSWORD="password"
 INSTALL_UI_CERTS=true
 INSTALL_JM_CERTS=true
 INSTALL_SEARCH_HEAD_CERTS=true
+# Missing: UBA internal keystore and Kafka keystores
+INSTALL_UBA_KEYSTORE=true
+INSTALL_KAFKA_CERTS=false  # Optional, only if Kafka ingestion is used
 VALIDATE_CERTS=true
 RESTART_SERVICES=true
 DRY_RUN=false
@@ -212,11 +225,14 @@ REQUIRED OPTIONS:
     -s, --source-dir DIR        Source directory containing PEM certificates
 
 OPTIONAL OPTIONS:
+    --java-home PATH            Specify custom JAVA_HOME path (skips auto-detection)
     --no-pkcs12                 Skip PKCS12 generation (default: generate)
     --pkcs12-password PASS      PKCS12 password (default: "password")
     --no-ui-certs              Skip UI certificate installation
     --no-jm-certs              Skip Job Manager certificate installation
     --no-search-head-certs     Skip search head certificate installation
+    --no-uba-keystore          Skip UBA internal keystore installation
+    --enable-kafka-certs       Enable Kafka certificate installation (default: disabled)
     --no-validation            Skip certificate validation
     --no-restart               Skip service restart
     --pull-from HOST[:PORT]     Pull certificate from Splunk instance (can be used multiple times)
@@ -234,6 +250,12 @@ CERTIFICATE REQUIREMENTS:
 EXAMPLES:
     # Install all certificates from /opt/certs directory
     $SCRIPT_NAME -s /opt/certs
+
+    # Use custom Java installation
+    $SCRIPT_NAME -s /opt/certs --java-home /usr/lib/jvm/java-11-openjdk
+
+    # Use custom Java installation with specific components
+    $SCRIPT_NAME -s /opt/certs --java-home /usr/java/jdk1.8.0_321 --no-search-head-certs
 
     # Install only UI certificates with custom password
     $SCRIPT_NAME -s /opt/certs --no-jm-certs --no-search-head-certs --pkcs12-password mypass
@@ -263,8 +285,10 @@ SPLUNK CERTIFICATE PULLING:
 FILES MANAGED:
     - UBA Site Properties: $UBA_SITE_PROPERTIES
     - Job Manager Keystore: $UBA_KEYSTORE_JM
+    - UBA Internal Keystore: $UBA_KEYSTORE (CRITICAL FOR CLUSTER COMMUNICATION)
     - Java CA Certificates: $JAVA_CACERTS
     - Custom Certificates: $UBA_CUSTOM_CERTS_DIR
+    - Kafka Keystores: $KAFKA_KEYSTORE_CONFIG, $KAFKA_TRUSTSTORE (if enabled)
 
 EOF
 }
@@ -278,12 +302,43 @@ check_prerequisites() {
     
     # Check if running as caspida user or root
     if [[ "$EUID" -ne 0 ]] && [[ "$(whoami)" != "caspida" ]]; then
-        log_error "Script must be run as root or caspida user"
+        log_error "This script must be run as root or caspida user"
         exit 1
     fi
     
-    # Java environment is already validated by detect_java_home()
-    log "Using JAVA_HOME: $JAVA_HOME"
+    # Initialize Java environment - either custom or auto-detect
+    if [[ -n "$CUSTOM_JAVA_HOME" ]]; then
+        log "Using custom JAVA_HOME: $CUSTOM_JAVA_HOME"
+        export JAVA_HOME="$CUSTOM_JAVA_HOME"
+        
+        # Validate custom JAVA_HOME
+        if [[ ! -d "$JAVA_HOME" ]]; then
+            log_error "Custom JAVA_HOME directory does not exist: $JAVA_HOME"
+            exit 1
+        fi
+        
+        if [[ ! -x "$JAVA_HOME/bin/java" ]]; then
+            log_error "Java executable not found at: $JAVA_HOME/bin/java"
+            exit 1
+        fi
+        
+        if [[ ! -x "$JAVA_HOME/bin/keytool" ]]; then
+            log_error "Keytool not found at: $JAVA_HOME/bin/keytool"
+            exit 1
+        fi
+        
+        log "Custom Java installation validated: $JAVA_HOME"
+    else
+        log "Auto-detecting Java installation..."
+        detect_java_home
+    fi
+    
+    # Update JAVA_CACERTS path now that JAVA_HOME is set
+    JAVA_CACERTS="${JAVA_HOME}/lib/security/cacerts"
+    log "Final Java configuration:"
+    log "  JAVA_HOME: $JAVA_HOME"
+    log "  Java version: $("$JAVA_HOME/bin/java" -version 2>&1 | head -n1 | cut -d'"' -f2)"
+    log "  Java cacerts: $JAVA_CACERTS"
     
     # Check OpenSSL
     if ! command -v openssl &> /dev/null; then
@@ -860,6 +915,99 @@ install_search_head_certificates() {
     log "Installed $cert_count CA certificates to Java truststore"
 }
 
+install_uba_keystore_certificates() {
+    log "Installing certificates to UBA internal keystore..."
+    
+    # Validate keystore access before proceeding (if keystore exists)
+    if [[ -f "$UBA_KEYSTORE" ]]; then
+        if ! check_keystore_access "$UBA_KEYSTORE" "password" "JKS"; then
+            log_error "Cannot access existing UBA keystore, aborting installation"
+            return 1
+        fi
+    fi
+    
+    # Find appropriate certificate for UBA internal communication
+    local uba_cert=""
+    local uba_key=""
+    local uba_hostname=$(hostname -s)
+    
+    # Try to find matching certificate
+    for name in "$uba_hostname" "uba" "server" "$(hostname -f)"; do
+        if [[ -n "${CERT_FILES[$name]:-}" ]]; then
+            uba_cert="${CERT_FILES[$name]}"
+            uba_key="${KEY_FILES[$name]:-}"
+            break
+        fi
+    done
+    
+    if [[ -z "$uba_cert" ]] || [[ -z "$uba_key" ]]; then
+        log_warn "No matching certificate/key pair found for UBA keystore"
+        return 1
+    fi
+    
+    if [[ "$VALIDATE_CERTS" == "true" ]]; then
+        if ! validate_certificate "$uba_cert" "$uba_key"; then
+            log_error "Certificate validation failed for UBA keystore"
+            return 1
+        fi
+    fi
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log "DRY RUN: Would install UBA keystore certificates"
+        return 0
+    fi
+    
+    # Generate PKCS12 for UBA keystore
+    local pkcs12_file="$UBA_CUSTOM_CERTS_DIR/uba-internal.p12"
+    generate_pkcs12 "$uba_cert" "$uba_key" "$pkcs12_file" "uba-server"
+    
+    # Backup existing keystore
+    if [[ -f "$UBA_KEYSTORE" ]]; then
+        cp "$UBA_KEYSTORE" "$UBA_KEYSTORE.backup.$(date +%Y%m%d_%H%M%S)"
+    fi
+    
+    # Create keystore directory if needed
+    mkdir -p "$(dirname "$UBA_KEYSTORE")"
+    
+    # Check if uba-server alias exists and delete if present
+    if [[ -f "$UBA_KEYSTORE" ]] && "$JAVA_HOME/bin/keytool" -list -keystore "$UBA_KEYSTORE" -storepass "password" -alias "uba-server" &>/dev/null; then
+        log "Removing existing 'uba-server' certificate from UBA keystore"
+        "$JAVA_HOME/bin/keytool" -delete -alias "uba-server" -keystore "$UBA_KEYSTORE" -storepass "password"
+    fi
+    
+    # Import new certificate
+    "$JAVA_HOME/bin/keytool" -importkeystore -destkeystore "$UBA_KEYSTORE" -srckeystore "$pkcs12_file" -srcstoretype PKCS12 -deststorepass "password" -srcstorepass "$PKCS12_PASSWORD" -srcalias "uba-server" -destalias "uba-server" -noprompt
+    
+    # Verify import
+    if "$JAVA_HOME/bin/keytool" -list -v -keystore "$UBA_KEYSTORE" -storepass "password" | grep -q "uba-server"; then
+        log "UBA keystore certificate installed successfully"
+        
+        # Sync keystore with all UBA nodes (per documentation)
+        if [[ -f "/opt/caspida/bin/Caspida" ]]; then
+            sudo -u caspida /opt/caspida/bin/Caspida setup-uba-keystore 2>/dev/null || {
+                log_warn "Failed to sync UBA keystore - may need manual sync across cluster nodes"
+            }
+        fi
+    else
+        log_error "Failed to install UBA keystore certificate"
+        return 1
+    fi
+}
+
+install_kafka_certificates() {
+    log "Installing Kafka certificates..."
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log "DRY RUN: Would install Kafka certificates"
+        return 0
+    fi
+    
+    # This function would handle Kafka keystore/truststore setup
+    # Implementation depends on specific Kafka SSL requirements
+    log_warn "Kafka certificate installation not yet implemented"
+    log_warn "Refer to UBA documentation for manual Kafka SSL setup if using Kafka ingestion"
+}
+
 update_site_properties() {
     local root_ca="$1"
     local private_key="$2"
@@ -1069,6 +1217,20 @@ process_certificates() {
         fi
     fi
     
+    # Install UBA internal keystore certificates (MISSING CRITICAL COMPONENT)
+    if [[ "$INSTALL_UBA_KEYSTORE" == "true" ]]; then
+        if ! install_uba_keystore_certificates; then
+            ((install_errors++))
+        fi
+    fi
+    
+    # Install Kafka certificates (if enabled)
+    if [[ "$INSTALL_KAFKA_CERTS" == "true" ]]; then
+        if ! install_kafka_certificates; then
+            ((install_errors++))
+        fi
+    fi
+
     if [[ "$install_errors" -gt 0 ]]; then
         log_warn "$install_errors certificate installation(s) had errors"
     fi
@@ -1099,6 +1261,10 @@ main() {
                 CERT_SOURCE_DIR="$2"
                 shift 2
                 ;;
+            --java-home)
+                CUSTOM_JAVA_HOME="$2"
+                shift 2
+                ;;
             --no-pkcs12)
                 GENERATE_PKCS12=false
                 shift
@@ -1117,6 +1283,14 @@ main() {
                 ;;
             --no-search-head-certs)
                 INSTALL_SEARCH_HEAD_CERTS=false
+                shift
+                ;;
+            --no-uba-keystore)
+                INSTALL_UBA_KEYSTORE=false
+                shift
+                ;;
+            --enable-kafka-certs)
+                INSTALL_KAFKA_CERTS=true
                 shift
                 ;;
             --no-validation)
@@ -1168,6 +1342,9 @@ main() {
     # Print banner
     print_status "UBA Certificate Installation Script v$SCRIPT_VERSION"
     print_status "Source Directory: $CERT_SOURCE_DIR"
+    if [[ -n "$CUSTOM_JAVA_HOME" ]]; then
+        print_status "Custom JAVA_HOME: $CUSTOM_JAVA_HOME"
+    fi
     print_status "Log File: $LOG_FILE"
     
     if [[ "$DRY_RUN" == "true" ]]; then
@@ -1177,7 +1354,10 @@ main() {
     # Run main processing
     log "Starting UBA certificate installation process"
     log "Source directory: $CERT_SOURCE_DIR"
-    log "Configuration: UI=$INSTALL_UI_CERTS, JM=$INSTALL_JM_CERTS, SearchHead=$INSTALL_SEARCH_HEAD_CERTS"
+    if [[ -n "$CUSTOM_JAVA_HOME" ]]; then
+        log "Using custom JAVA_HOME: $CUSTOM_JAVA_HOME"
+    fi
+    log "Configuration: UI=$INSTALL_UI_CERTS, JM=$INSTALL_JM_CERTS, SearchHead=$INSTALL_SEARCH_HEAD_CERTS, UBA_Keystore=$INSTALL_UBA_KEYSTORE"
     
     # Handle remote certificate pulling if requested
     if [[ ${#SPLUNK_HOSTS[@]} -gt 0 ]]; then
