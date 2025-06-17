@@ -63,6 +63,22 @@ check_file() {
     return 0
 }
 
+# Helper function to check file access for a specific user
+check_file_access() {
+    local file="$1"
+    local user="${2:-root}"
+    
+    if [[ ! -f "$file" ]]; then
+        return 1
+    fi
+    
+    if [[ "$user" == "caspida" ]]; then
+        sudo -u caspida test -r "$file"
+    else
+        test -r "$file"
+    fi
+}
+
 # Function to extract configuration values
 get_config_value() {
     local config_file="$1"
@@ -625,3 +641,225 @@ get_certificate_count() {
         eval "$list_cmd" 2>/dev/null | grep -c "Certificate fingerprint" || echo "0"
     fi
 }
+
+# Function to detect JAVA_HOME automatically
+detect_java_home() {
+    local java_home_candidates=(
+        "/usr/lib/jvm/java-1.8.0-openjdk"
+        "/usr/lib/jvm/java-8-openjdk"
+        "/usr/lib/jvm/java-11-openjdk"
+        "/usr/lib/jvm/java-8-oracle"
+        "/usr/java/latest"
+        "/opt/java"
+        "/System/Library/Frameworks/JavaVM.framework/Home"
+    )
+    
+    # Check if JAVA_HOME is already set and valid
+    if [[ -n "${JAVA_HOME:-}" && -f "$JAVA_HOME/bin/keytool" ]]; then
+        echo "$JAVA_HOME"
+        return 0
+    fi
+    
+    # Try to find java command in PATH
+    if command -v java >/dev/null 2>&1; then
+        local java_path=$(command -v java)
+        # Follow symlinks to get real path
+        while [[ -L "$java_path" ]]; do
+            java_path=$(readlink "$java_path")
+        done
+        # Extract JAVA_HOME from java binary path
+        local potential_home=$(dirname "$(dirname "$java_path")")
+        if [[ -f "$potential_home/bin/keytool" ]]; then
+            echo "$potential_home"
+            return 0
+        fi
+    fi
+    
+    # Try known candidate directories
+    for candidate in "${java_home_candidates[@]}"; do
+        if [[ -f "$candidate/bin/keytool" ]]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    
+    return 1
+}
+
+# Main validation function
+main() {
+    local show_summary=false
+    local custom_java_home=""
+    
+    # Parse command line arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -j|--java-home)
+                custom_java_home="$2"
+                shift 2
+                ;;
+            -s|--summary)
+                show_summary=true
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                error "Unknown option: $1"
+                usage
+                exit 1
+                ;;
+        esac
+    done
+    
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        error "This script must be run as root to use 'sudo -u caspida'"
+        echo "Please run: sudo $0"
+        exit 1
+    fi
+    
+    # Set global variables
+    validation_errors=0
+    caspida_home="${CASPIDA_HOME:-/opt/caspida}"
+    
+    # Detect JAVA_HOME
+    if [[ -n "$custom_java_home" ]]; then
+        if [[ ! -f "$custom_java_home/bin/keytool" ]]; then
+            error "Invalid JAVA_HOME: $custom_java_home (keytool not found)"
+            exit 1
+        fi
+        java_home="$custom_java_home"
+    else
+        java_home=$(detect_java_home)
+        if [[ -z "$java_home" ]]; then
+            error "Could not detect JAVA_HOME. Please specify with --java-home option"
+            exit 1
+        fi
+    fi
+    
+    export JAVA_HOME="$java_home"
+    
+    log "UBA Keystore and Certificate Validation"
+    log "========================================"
+    echo "JAVA_HOME: $java_home"
+    echo "CASPIDA_HOME: $caspida_home"
+    echo ""
+    
+    # Validate caspida home directory
+    if [[ ! -d "$caspida_home" ]]; then
+        error "CASPIDA_HOME directory not found: $caspida_home"
+        exit 1
+    fi
+    
+    # Check if caspida user exists
+    if ! id caspida >/dev/null 2>&1; then
+        error "User 'caspida' not found"
+        exit 1
+    fi
+    
+    # Validate UBA keystore
+    local uba_keystore="$caspida_home/conf/keystore/uba-keystore"
+    if [[ -f "$uba_keystore" ]]; then
+        local uba_password=$(get_uba_keystore_password "$caspida_home")
+        if [[ -n "$uba_password" ]]; then
+            if validate_keystore "$uba_keystore" "$uba_password" "UBA Unified Keystore" "caspida"; then
+                success "UBA keystore validation completed"
+            else
+                ((validation_errors++))
+            fi
+        else
+            warning "UBA keystore password not found"
+            ((validation_errors++))
+        fi
+    else
+        warning "UBA keystore not found at $uba_keystore"
+    fi
+    
+    # Validate JobManager keystore
+    local jm_info=$(get_jobmanager_keystore_info "$caspida_home")
+    if [[ -n "$jm_info" ]]; then
+        local jm_keystore=$(echo "$jm_info" | cut -d'|' -f1)
+        local jm_password=$(echo "$jm_info" | cut -d'|' -f2)
+        
+        if validate_keystore "$jm_keystore" "$jm_password" "JobManager Keystore" "caspida"; then
+            success "JobManager keystore validation completed"
+        else
+            ((validation_errors++))
+        fi
+    else
+        warning "JobManager keystore not found or password not available"
+    fi
+    
+    # Validate Kafka keystores
+    local kafka_keystore="$caspida_home/conf/kafka/auth/server.keystore.jks"
+    if [[ -f "$kafka_keystore" ]]; then
+        local kafka_password=$(test_keystore_passwords "$kafka_keystore" "caspida" "Kafka keystore")
+        if [[ -n "$kafka_password" ]]; then
+            if validate_keystore "$kafka_keystore" "$kafka_password" "Kafka Server Keystore" "caspida"; then
+                success "Kafka keystore validation completed"
+            else
+                ((validation_errors++))
+            fi
+        else
+            warning "Kafka keystore password not found"
+            ((validation_errors++))
+        fi
+    else
+        log "Kafka keystore not found (may not be configured)"
+    fi
+    
+    # Validate Java system truststore
+    local system_cacerts=$(find -L "$java_home" -name cacerts 2>/dev/null | head -1)
+    if [[ -f "$system_cacerts" ]]; then
+        if validate_keystore "$system_cacerts" "changeit" "Java System Truststore" "root"; then
+            success "Java system truststore validation completed"
+        else
+            ((validation_errors++))
+        fi
+    else
+        warning "Java system truststore (cacerts) not found"
+        ((validation_errors++))
+    fi
+    
+    # Validate trust relationships
+    validate_trust_relationships "$caspida_home"
+    
+    # Final summary
+    echo ""
+    log "Validation Summary"
+    log "=================="
+    
+    if [[ $validation_errors -eq 0 ]]; then
+        success "All keystore validations passed successfully!"
+        echo "✓ UBA certificate infrastructure appears to be properly configured"
+        echo "✓ All keystores are accessible and contain valid certificates"
+        echo "✓ Trust relationships have been validated"
+    else
+        error "Found $validation_errors validation errors"
+        echo "✗ Some keystores may have issues that need attention"
+        echo "✗ Review the errors above and fix before production use"
+    fi
+    
+    echo ""
+    log "Recommendations:"
+    echo "• Monitor certificate expiration dates regularly"
+    echo "• Test SSL connections to verify trust chains work correctly"
+    echo "• Backup keystores before making any changes"
+    echo "• Use secure passwords for production keystores"
+    
+    # Generate machine-readable summary if requested
+    if [[ "$show_summary" == true ]]; then
+        echo ""
+        log "Generating machine-readable summary report..."
+        generate_summary_report
+    fi
+    
+    # Exit with error code if there were validation issues
+    exit $validation_errors
+}
+
+# Run main function with all arguments
+main "$@"
