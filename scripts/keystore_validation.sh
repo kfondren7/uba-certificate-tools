@@ -278,30 +278,6 @@ get_keystore_aliases() {
     fi
 }
 
-# Function to get JobManager keystore password using the same logic as the main validation
-get_jobmanager_keystore_info() {
-    local caspida_home="${1:-/opt/caspida}"
-    
-    local jobmgr_config="$caspida_home/conf/jobconf/jobmgr.yml"
-    if [[ -f "$jobmgr_config" ]]; then
-        local jm_keystore=$(get_config_value "$jobmgr_config" "keyStorePath")
-        local jm_password=$(get_config_value "$jobmgr_config" "keyStorePassword")
-        
-        if [[ -n "$jm_keystore" ]]; then
-            jm_keystore=$(resolve_path "$jm_keystore")
-            
-            # If no password from config, try defaults
-            if [[ -z "$jm_password" && -f "$jm_keystore" ]]; then
-                jm_password=$(test_keystore_passwords "$jm_keystore" "caspida" "JobManager keystore")
-            fi
-            
-            if [[ -n "$jm_password" ]]; then
-                echo "$jm_keystore|$jm_password"
-            fi
-        fi
-    fi
-}
-
 # Function to test keystore with multiple password attempts
 test_keystore_passwords() {
     local keystore_path="$1"
@@ -338,6 +314,30 @@ test_keystore_passwords() {
     done
     
     return 1
+}
+
+# Function to get JobManager keystore password using the same logic as the main validation
+get_jobmanager_keystore_info() {
+    local caspida_home="${1:-/opt/caspida}"
+    
+    local jobmgr_config="$caspida_home/conf/jobconf/jobmgr.yml"
+    if [[ -f "$jobmgr_config" ]]; then
+        local jm_keystore=$(get_config_value "$jobmgr_config" "keyStorePath")
+        local jm_password=$(get_config_value "$jobmgr_config" "keyStorePassword")
+        
+        if [[ -n "$jm_keystore" ]]; then
+            jm_keystore=$(resolve_path "$jm_keystore")
+            
+            # If no password from config, try defaults
+            if [[ -z "$jm_password" && -f "$jm_keystore" ]]; then
+                jm_password=$(test_keystore_passwords "$jm_keystore" "caspida" "JobManager keystore")
+            fi
+            
+            if [[ -n "$jm_password" ]]; then
+                echo "$jm_keystore|$jm_password"
+            fi
+        fi
+    fi
 }
 
 # Function to get UBA keystore password using the same logic as the main validation
@@ -396,12 +396,23 @@ validate_trust_relationships() {
     
     # Define keystore and truststore paths for testing
     local jm_config="$caspida_home/conf/jobconf/jobmgr.yml"
-    local java_truststore="/usr/lib/jvm/java-1.8.0-openjdk/jre/lib/security/cacerts"
+    local java_truststore=$(find -L "${JAVA_HOME:-/usr/lib/jvm/java-1.8.0-openjdk}" -name cacerts 2>/dev/null | head -1)
     local uba_keystore="$caspida_home/conf/keystore/uba-keystore"
     
     # Focus on keystores that were validated successfully
     log "Testing trust relationships for validated keystores..."
     echo ""
+    
+    # Get keytool path from JAVA_HOME
+    local keytool_cmd="keytool"
+    if [[ -n "${JAVA_HOME:-}" && -f "$JAVA_HOME/bin/keytool" ]]; then
+        keytool_cmd="$JAVA_HOME/bin/keytool"
+    elif command -v keytool >/dev/null 2>&1; then
+        keytool_cmd="keytool"
+    else
+        error "keytool not found in JAVA_HOME or PATH"
+        return 1
+    fi
     
     # Test UBA keystore trust (this was successfully validated)
     if [[ -f "$uba_keystore" ]]; then
@@ -412,7 +423,7 @@ validate_trust_relationships() {
             
             # Get aliases from UBA keystore using system truststore format (which we know works)
             local aliases
-            if aliases=$(sudo -u caspida bash -c "export PATH='$PATH'; /usr/lib/jvm/java-1.8.0-openjdk/bin/keytool -list -keystore '$uba_keystore' -storepass '$uba_pass'" 2>/dev/null | grep ", trustedCertEntry,\|, PrivateKeyEntry," | awk -F',' '{print $1}' | head -5); then
+            if aliases=$(sudo -u caspida bash -c "export PATH='$PATH'; $keytool_cmd -list -keystore '$uba_keystore' -storepass '$uba_pass'" 2>/dev/null | grep ", trustedCertEntry,\|, PrivateKeyEntry," | awk -F',' '{print $1}' | head -5); then
                 
                 local found_certs=false
                 while IFS= read -r alias; do
@@ -424,10 +435,10 @@ validate_trust_relationships() {
                         
                         # Extract certificate from UBA keystore (simplified approach)
                         local cert_file="$temp_cert_dir/uba_${alias// /_}.crt"
-                        if sudo -u caspida bash -c "export PATH='$PATH'; /usr/lib/jvm/java-1.8.0-openjdk/bin/keytool -export -alias \"$alias\" -keystore '$uba_keystore' -storepass '$uba_pass' -file '$cert_file'" >/dev/null 2>&1; then
+                        if sudo -u caspida bash -c "export PATH='$PATH'; $keytool_cmd -export -alias \"$alias\" -keystore '$uba_keystore' -storepass '$uba_pass' -file '$cert_file'" >/dev/null 2>&1; then
                             
                             # Test if this certificate is present in Java system truststore
-                            if /usr/lib/jvm/java-1.8.0-openjdk/bin/keytool -list -keystore "$java_truststore" -storepass "changeit" -alias "$alias" >/dev/null 2>&1; then
+                            if $keytool_cmd -list -keystore "$java_truststore" -storepass "changeit" -alias "$alias" >/dev/null 2>&1; then
                                 success "    ✓ Certificate '$alias' is present in Java system truststore"
                             else
                                 warning "    ✗ Certificate '$alias' is NOT present in Java system truststore"
@@ -435,7 +446,7 @@ validate_trust_relationships() {
                             
                             # Also test by importing the cert to verify it would be trusted
                             local temp_truststore="$temp_cert_dir/test_truststore.jks"
-                            if /usr/lib/jvm/java-1.8.0-openjdk/bin/keytool -import -noprompt -alias "test_$alias" -file "$cert_file" -keystore "$temp_truststore" -storepass "testpass" >/dev/null 2>&1; then
+                            if $keytool_cmd -import -noprompt -alias "test_$alias" -file "$cert_file" -keystore "$temp_truststore" -storepass "testpass" >/dev/null 2>&1; then
                                 success "    ✓ Certificate '$alias' can be imported (is valid)"
                             else
                                 warning "    ✗ Certificate '$alias' cannot be imported (may be invalid)"
@@ -468,7 +479,7 @@ validate_trust_relationships() {
             log "Testing JobManager keystore certificate trust against Java system truststore..."
             
             local aliases
-            if aliases=$(sudo -u caspida bash -c "export PATH='$PATH'; /usr/lib/jvm/java-1.8.0-openjdk/bin/keytool -list -keystore '$jm_keystore' -storepass '$jm_password'" 2>/dev/null | grep ", trustedCertEntry,\|, PrivateKeyEntry," | awk -F',' '{print $1}' | head -5); then
+            if aliases=$(sudo -u caspida bash -c "export PATH='$PATH'; $keytool_cmd -list -keystore '$jm_keystore' -storepass '$jm_password'" 2>/dev/null | grep ", trustedCertEntry,\|, PrivateKeyEntry," | awk -F',' '{print $1}' | head -5); then
                 
                 local found_certs=false
                 while IFS= read -r alias; do
@@ -480,10 +491,10 @@ validate_trust_relationships() {
                         
                         # Extract certificate from JobManager keystore (simplified approach)
                         local cert_file="$temp_cert_dir/jm_${alias// /_}.crt"
-                        if sudo -u caspida bash -c "export PATH='$PATH'; /usr/lib/jvm/java-1.8.0-openjdk/bin/keytool -export -alias \"$alias\" -keystore '$jm_keystore' -storepass '$jm_password' -file '$cert_file'" >/dev/null 2>&1; then
+                        if sudo -u caspida bash -c "export PATH='$PATH'; $keytool_cmd -export -alias \"$alias\" -keystore '$jm_keystore' -storepass '$jm_password' -file '$cert_file'" >/dev/null 2>&1; then
                             
                             # Test if this certificate is present in Java system truststore
-                            if /usr/lib/jvm/java-1.8.0-openjdk/bin/keytool -list -keystore "$java_truststore" -storepass "changeit" -alias "$alias" >/dev/null 2>&1; then
+                            if $keytool_cmd -list -keystore "$java_truststore" -storepass "changeit" -alias "$alias" >/dev/null 2>&1; then
                                 success "    ✓ Certificate '$alias' is present in Java system truststore"
                             else
                                 warning "    ✗ Certificate '$alias' is NOT present in Java system truststore"
@@ -492,7 +503,7 @@ validate_trust_relationships() {
                             # Test if this cert is in UBA keystore
                             if [[ -f "$uba_keystore" ]]; then
                                 local uba_pass=$(get_uba_keystore_password "$caspida_home")
-                                if [[ -n "$uba_pass" ]] && sudo -u caspida bash -c "export PATH='$PATH'; /usr/lib/jvm/java-1.8.0-openjdk/bin/keytool -list -keystore '$uba_keystore' -storepass '$uba_pass' -alias '$alias'" >/dev/null 2>&1; then
+                                if [[ -n "$uba_pass" ]] && sudo -u caspida bash -c "export PATH='$PATH'; $keytool_cmd -list -keystore '$uba_keystore' -storepass '$uba_pass' -alias '$alias'" >/dev/null 2>&1; then
                                     success "    ✓ Certificate '$alias' is present in UBA keystore"
                                 else
                                     warning "    ✗ Certificate '$alias' is NOT present in UBA keystore"
@@ -585,7 +596,7 @@ EOF
     fi
     
     # Add Java truststore info
-    local system_cacerts=$(find -L "$java_home" -name cacerts 2>/dev/null | head -1)
+    local system_cacerts=$(find -L "${JAVA_HOME:-/usr/lib/jvm/java-1.8.0-openjdk}" -name cacerts 2>/dev/null | head -1)
     if [[ -f "$system_cacerts" ]]; then
         [[ "$first" == true ]] && first=false || echo ","
         echo "    {"
@@ -684,6 +695,204 @@ detect_java_home() {
     done
     
     return 1
+}
+
+# Function to scan configuration files for certificate paths and validate them
+validate_config_certificates() {
+    local caspida_home="${1:-/opt/caspida}"
+    
+    log "Configuration Certificate Validation"
+    echo "===================================="
+    echo ""
+    
+    local config_dirs=(
+        "$caspida_home/conf"
+        "$caspida_home/conf/jobconf"
+        "/etc/caspida/conf"
+    )
+    
+    local cert_paths=()
+    local validated_count=0
+    local failed_count=0
+    
+    # Search for certificate file references in configuration files
+    for config_dir in "${config_dirs[@]}"; do
+        if [[ -d "$config_dir" ]]; then
+            # Find certificate paths in various config file formats
+            while IFS= read -r line; do
+                if [[ -n "$line" ]]; then
+                    cert_paths+=("$line")
+                fi
+            done < <(find "$config_dir" -type f \( -name "*.properties" -o -name "*.yml" -o -name "*.yaml" -o -name "*.xml" \) -exec grep -l -E "\.(crt|pem|p12|jks|keystore|key)(\"|'|$|\s)" {} \; 2>/dev/null | head -20)
+        fi
+    done
+    
+    if [[ ${#cert_paths[@]} -eq 0 ]]; then
+        warning "No certificate references found in configuration files"
+        echo ""
+        return
+    fi
+    
+    log "Found ${#cert_paths[@]} configuration files with certificate references"
+    echo ""
+    
+    # Process each configuration file to extract certificate paths
+    for config_file in "${cert_paths[@]}"; do
+        log "Scanning: $config_file"
+        
+        # Extract potential certificate paths from the file
+        while IFS= read -r line; do
+            # Skip comments and empty lines
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+            [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+            
+            # Look for certificate file paths in the line
+            local potential_paths=()
+            
+            # Extract paths after = (properties files)
+            if [[ "$line" =~ ^[[:space:]]*[^=]+=[[:space:]]*(.+) ]]; then
+                local value="${BASH_REMATCH[1]}"
+                if [[ "$value" =~ \.(crt|pem|p12|jks|keystore|key|cert)([[:space:]]|$) ]]; then
+                    # Clean the value and check if it looks like a path
+                    value=$(echo "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sed 's/["\x27]//g')
+                    if [[ "$value" =~ ^[/] || ( "$value" =~ ^[a-zA-Z] && ! "$value" =~ [[:space:]] ) ]]; then
+                        potential_paths+=("$value")
+                    fi
+                fi
+            fi
+            
+            # Extract paths after : (YAML files)
+            if [[ "$line" =~ ^[[:space:]]*[^:]+:[[:space:]]*(.+) ]]; then
+                local value="${BASH_REMATCH[1]}"
+                if [[ "$value" =~ \.(crt|pem|p12|jks|keystore|key|cert)([[:space:]]|$) ]]; then
+                    # Clean the value and check if it looks like a path
+                    value=$(echo "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sed 's/["\x27]//g')
+                    if [[ "$value" =~ ^[/] || ( "$value" =~ ^[a-zA-Z] && ! "$value" =~ [[:space:]] ) ]]; then
+                        potential_paths+=("$value")
+                    fi
+                fi
+            fi
+            
+            # Process each potential path
+            for path in "${potential_paths[@]}"; do
+                # Skip obvious non-paths
+                [[ "$path" =~ ^[#] ]] && continue
+                [[ "$path" =~ ^[a-zA-Z]+[[:space:]]*$ ]] && continue
+                [[ "$path" =~ : ]] && continue
+                
+                # Resolve the path properly
+                local cert_path=$(resolve_path "$path")
+                
+                # Convert relative paths to absolute paths
+                if [[ ! "$cert_path" =~ ^/ ]]; then
+                    # For relative paths, try multiple base directories
+                    local base_dirs=(
+                        "$caspida_home"
+                        "$(dirname "$config_file")"
+                        "/opt/caspida"
+                        "/etc/caspida"
+                    )
+                    
+                    local found_path=""
+                    for base_dir in "${base_dirs[@]}"; do
+                        local test_path="$base_dir/$cert_path"
+                        if [[ -f "$test_path" ]]; then
+                            found_path="$test_path"
+                            break
+                        fi
+                    done
+                    
+                    if [[ -n "$found_path" ]]; then
+                        cert_path="$found_path"
+                    else
+                        # If not found, use the most likely path for better error reporting
+                        cert_path="$caspida_home/$cert_path"
+                    fi
+                fi
+                
+                echo "  Checking: $cert_path"
+                
+                if [[ -f "$cert_path" ]]; then
+                    case "$cert_path" in
+                        *.jks|*.keystore)
+                            local password=$(test_keystore_passwords "$cert_path" "caspida" "Config keystore")
+                            if [[ -n "$password" ]]; then
+                                success "    ✓ Valid keystore"
+                                ((validated_count++))
+                            else
+                                error "    ✗ Invalid keystore or unknown password"
+                                ((failed_count++))
+                            fi
+                            ;;
+                        *.p12)
+                            if openssl pkcs12 -info -in "$cert_path" -passin pass: -noout >/dev/null 2>&1; then
+                                success "    ✓ Valid PKCS#12 certificate"
+                                ((validated_count++))
+                            else
+                                error "    ✗ Invalid PKCS#12 file"
+                                ((failed_count++))
+                            fi
+                            ;;
+                        *.crt|*.pem|*.cert)
+                            if openssl x509 -in "$cert_path" -text -noout >/dev/null 2>&1; then
+                                success "    ✓ Valid X.509 certificate"
+                                ((validated_count++))
+                            else
+                                error "    ✗ Invalid certificate format"
+                                ((failed_count++))
+                            fi
+                            ;;
+                        *.key)
+                            # Skip validation of private keys unless they're special cases
+                            if [[ "$cert_path" =~ snakeoil ]]; then
+                                warning "    ⚠ Snakeoil private key reference found"
+                                echo "      ℹ  This is a placeholder private key, typically not used in production"
+                            else
+                                warning "    ⚠ Private key file detected, skipping validation"
+                                echo "      ℹ  Private key validation is not performed for security reasons"
+                            fi
+                            ;;
+                        *)
+                            warning "    ⚠ Unknown certificate type, skipping"
+                            ;;
+                    esac
+                else
+                    # Special handling for known placeholder/example certificates
+                    if [[ "$cert_path" =~ snakeoil ]]; then
+                        warning "    ⚠ Snakeoil certificate reference found: $cert_path"
+                        echo "      ℹ  Snakeoil certificates are placeholder/example certificates"
+                        echo "      ℹ  This is typically not used in production and can be ignored"
+                        echo "      ℹ  Consider updating the configuration to use actual certificates"
+                    elif [[ "$cert_path" =~ (example|sample|test|dummy|placeholder) ]]; then
+                        warning "    ⚠ Example/placeholder certificate reference: $cert_path"
+                        echo "      ℹ  This appears to be a placeholder certificate path"
+                        echo "      ℹ  Consider updating the configuration to use actual certificates"
+                    elif [[ "$cert_path" =~ \.key$ ]]; then
+                        warning "    ⚠ Private key file not found: $cert_path"
+                        echo "      ℹ  Private key files are not validated for security reasons"
+                        echo "      ℹ  Ensure the file exists and has proper permissions if needed"
+                    else
+                        error "    ✗ File not found: $cert_path"
+                        ((failed_count++))
+                    fi
+                fi
+            done
+        done < "$config_file"
+        echo ""
+    done
+    
+    # Summary
+    log "Configuration Certificate Summary:"
+    echo "Validated: $validated_count, Failed: $failed_count"
+    
+    if [[ $failed_count -gt 0 ]]; then
+        ((validation_errors += failed_count))
+        warning "Some configuration-referenced certificates have issues"
+    else
+        success "All configuration-referenced certificates are valid"
+    fi
+    
+    echo ""
 }
 
 # Main validation function
@@ -820,12 +1029,15 @@ main() {
             ((validation_errors++))
         fi
     else
-        warning "Java system truststore (cacerts) not found"
+        warning "Java system truststore (cacerts) not found in $java_home"
         ((validation_errors++))
     fi
     
     # Validate trust relationships
     validate_trust_relationships "$caspida_home"
+    
+    # Validate configuration-referenced certificates
+    validate_config_certificates "$caspida_home"
     
     # Final summary
     echo ""
